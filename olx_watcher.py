@@ -19,13 +19,27 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 import requests
 import yaml
 from bs4 import BeautifulSoup
+from curl_cffi import requests as impersonated
 
 ROOT = Path(__file__).parent
 STATE_PATH = ROOT / "data" / "watcher.sqlite3"
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/127 Safari/537.36",
-    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.7",
-}
+
+# OLX стоит за CloudFront, который режет запросы по TLS-отпечатку клиента,
+# а не по заголовкам: с сервера обычный requests получает 403 при любом наборе
+# User-Agent и Sec-Fetch-*, тогда как curl проходит. curl_cffi имитирует
+# отпечаток Chrome, поэтому выдача открывается и с Linux-машины.
+IMPERSONATE = "chrome"
+HEADERS = {"Accept-Language": "ru-RU,ru;q=0.9,en;q=0.7"}
+
+# curl_cffi не наследуется от requests.RequestException, поэтому сетевые ошибки
+# OLX ловим обоими классами: иначе сбой одной страницы уронил бы весь обход.
+NETWORK_ERRORS = (requests.RequestException, impersonated.RequestsError)
+
+
+def olx_session() -> impersonated.Session:
+    session = impersonated.Session(impersonate=IMPERSONATE)
+    session.headers.update(HEADERS)
+    return session
 
 
 @dataclass(frozen=True)
@@ -585,7 +599,7 @@ def load_config() -> dict:
 
 
 def debug_once(config: dict, count: int) -> None:
-    session = requests.Session(); session.headers.update(HEADERS)
+    session = olx_session()
     keywords = tuple(word.casefold() for word in config["required_any_keywords"])
     excluded = tuple(word.casefold() for word in config.get("excluded_any_keywords", []))
     hard_excluded = tuple(word.casefold() for word in config.get("hard_excluded_keywords", []))
@@ -618,7 +632,7 @@ def main(debug_count: int | None = None) -> None:
         raise SystemExit("Заполните TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID в .env.")
     storage = Storage()
     first_run = not storage.baseline_complete()
-    session = requests.Session(); session.headers.update(HEADERS)
+    session = olx_session()
     max_pages, page_delay = int(config.get("max_pages_per_search", 0)), float(config.get("page_delay_seconds", 1))
     stop = threading.Event()
     threading.Thread(target=telegram_listener, args=(token, stop), daemon=True, name="telegram-listener").start()
@@ -645,7 +659,7 @@ def main(debug_count: int | None = None) -> None:
                             response = session.get(page_url(search_url, page_number), timeout=25)
                             response.raise_for_status()
                             cards = extract_listings(search_url, response.text, int(config["max_candidates_per_search"]))
-                        except requests.RequestException as error:
+                        except NETWORK_ERRORS as error:
                             storage.record_error("Страница выдачи OLX", error)
                             logging.warning("Не удалось прочитать страницу %d: %s", page_number, error)
                             break
@@ -674,7 +688,7 @@ def main(debug_count: int | None = None) -> None:
                                         and not any(word in content for word in hard_excluded)
                                         and listing.price_kzt is not None and listing.price_kzt <= int(profile_config["max_price_kzt"])):
                                     notify(token, chat_id, listing, storage, profile_config); matched += 1
-                            except requests.RequestException as error:
+                            except NETWORK_ERRORS as error:
                                 storage.record_error("Карточка объявления OLX", error, brief)
                                 storage.add_baseline(brief)
                                 logging.warning("Пропущено объявление %s: %s", brief.ad_id, error)
