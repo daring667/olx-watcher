@@ -188,12 +188,13 @@ def assess(listing: Listing, config: dict) -> Listing:
 
 
 def price_limit(listing: Listing, config: dict) -> int:
-    """Потолок для объявления. Для распознанной модели — её normal_max, иначе
-    общий max_price_kzt. Раньше normal_max влиял только на текст подписи, а
-    отсекал всегда max_price_kzt: RTX 4060 с ориентиром 150 000 не проходила
-    при потолке 100 000 и не могла прийти никогда."""
-    model = next((item for item in config.get("models", []) if item.get("name") == listing.model), None)
-    return int(model["normal_max"]) if model else int(config["max_price_kzt"])
+    """Единый потолок для всех объявлений.
+
+    Раньше для распознанной модели брался её normal_max, но поиск устроен по
+    вендору, а не по модели: границы моделей остались только для подписи
+    «выгодно / нормальная цена». Решает цена и вендор, больше ничего.
+    """
+    return int(config["max_price_kzt"])
 
 
 def evaluate(listing: Listing, config: dict) -> str:
@@ -215,6 +216,14 @@ def evaluate(listing: Listing, config: dict) -> str:
     for word in config.get("excluded_any_keywords", []):
         if word.casefold() in title:
             return f"комплектующая: {word}"
+    # Чужого вендора ищем в заголовке: описание NVIDIA-карты сплошь и рядом
+    # сравнивает её с Radeon, и по описанию сюда попадала 21 чужая карта.
+    # Если в заголовке есть и наше ключевое слово — это сборный лот вроде
+    # «GTX 660Ti / R9 270X», такое оставляем.
+    if not any(word.casefold() in title for word in config["required_any_keywords"]):
+        for word in config.get("foreign_vendor_keywords", []):
+            if word.casefold() in title:
+                return f"другой вендор: {word}"
     if not any(word.casefold() in content for word in config["required_any_keywords"]) and not listing.model:
         return "нет ключевого слова"
     if listing.price_kzt is None:
