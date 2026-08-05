@@ -197,6 +197,15 @@ def price_limit(listing: Listing, config: dict) -> int:
     return int(config["max_price_kzt"])
 
 
+def model_number_in(number: str, title: str) -> bool:
+    """Номер модели в заголовке, но не часть разрешения экрана.
+
+    Отбрасывает «1920x1080» и «2560x1080», не задевая «gtx1660»: перед номером
+    запрещена только связка «цифра + x».
+    """
+    return re.search(rf"(?<!\d)(?<!\dx){re.escape(number)}(?!\d)", title) is not None
+
+
 def evaluate(listing: Listing, config: dict) -> str:
     """Причина отсева или пустая строка, если объявление проходит.
 
@@ -213,18 +222,28 @@ def evaluate(listing: Listing, config: dict) -> str:
     # «вентилятор», «кулер», «радиатор» и «термопрокладки» встречаются постоянно
     # — это рассказ про систему охлаждения. По описанию так терялось около 60
     # живых карт, а сам аксессуар всегда заявляет себя в заголовке.
-    for word in config.get("excluded_any_keywords", []):
-        if word.casefold() in title:
-            return f"комплектующая: {word}"
-    # Чужого вендора ищем в заголовке: описание NVIDIA-карты сплошь и рядом
-    # сравнивает её с Radeon, и по описанию сюда попадала 21 чужая карта.
-    # Если в заголовке есть и наше ключевое слово — это сборный лот вроде
-    # «GTX 660Ti / R9 270X», такое оставляем.
+    # Все эти правила смотрят ТОЛЬКО заголовок. В описании настоящей карты
+    # и «вентилятор», и сравнение с Radeon, и упоминание старой GT встречаются
+    # сплошь и рядом — по описанию сюда протекала 21 чужая карта и терялось
+    # около 60 своих. Товар всегда называет себя в заголовке.
+    for key, label in (("excluded_any_keywords", "комплектующая"),
+                       ("outdated_keywords", "устаревшая серия")):
+        for word in config.get(key, []):
+            if word.casefold() in title:
+                return f"{label}: {word}"
+    # У чужого вендора есть поблажка: если в заголовке есть и наше ключевое
+    # слово, это сборный лот вроде «GTX 660Ti / R9 270X» — такое оставляем.
     if not any(word.casefold() in title for word in config["required_any_keywords"]):
         for word in config.get("foreign_vendor_keywords", []):
             if word.casefold() in title:
                 return f"другой вендор: {word}"
-    if not any(word.casefold() in content for word in config["required_any_keywords"]) and not listing.model:
+    # Вендор ищем по всему тексту, голый номер модели — только в заголовке.
+    # «Видеокарта Palit 1660 ti» не содержит ни nvidia, ни geforce, и без этой
+    # проверки терялись 34 обычные карты. В описании номер брать нельзя:
+    # «тянет 1080p» есть почти везде.
+    if (not any(word.casefold() in content for word in config["required_any_keywords"])
+            and not any(model_number_in(str(number), title) for number in config.get("model_number_keywords", []))
+            and not listing.model):
         return "нет ключевого слова"
     if listing.price_kzt is None:
         return "цена не распознана"
