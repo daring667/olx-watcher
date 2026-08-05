@@ -1,0 +1,117 @@
+# Ссылку выдачи откройте на OLX вручную: выберите Алматы, «Видеокарты»,
+# сортировку «Сначала новые», затем скопируйте адрес из браузера сюда.
+search_urls:
+  - "https://www.olx.kz/d/elektronika/kompyutery-i-komplektuyuschie/komplektuyuschie-i-aksesuary/videokarty/alma-ata/"
+
+# Полный обход категории требует паузы между циклами, чтобы не перегружать OLX.
+poll_interval_seconds: 1800
+# 0 = идти до первой пустой страницы. Для ограничения обхода укажите число страниц.
+max_pages_per_search: 0
+# Небольшая пауза между страницами выдачи.
+page_delay_seconds: 1.5
+daily_summary_time: "21:00"
+max_price_kzt: 100000
+
+# Поиск идёт по заголовку и полному тексту объявления, без учёта регистра.
+required_any_keywords:
+  - "rtx"
+  - "gtx 1050"
+  - "gtx1050"
+  - "gtx 1060"
+  - "gtx1060"
+  - "gtx 1070"
+  - "gtx1070"
+
+# Белый список моделей и ваши ориентиры в тенге. Меняйте их под свою цель.
+# До excellent_max — выгодно, до normal_max — нормальная цена.
+models:
+  - name: "RTX 3060 Ti"
+    aliases: ["rtx 3060 ti", "rtx3060ti", "3060 ti", "3060ti"]
+    excellent_max: 95000
+    normal_max: 115000
+  - name: "RTX 3060"
+    aliases: ["rtx 3060", "rtx3060"]
+    excellent_max: 80000
+    normal_max: 95000
+  - name: "RTX 3070"
+    aliases: ["rtx 3070", "rtx3070"]
+    excellent_max: 110000
+    normal_max: 130000
+  - name: "RTX 4060"
+    aliases: ["rtx 4060", "rtx4060"]
+    excellent_max: 125000
+    normal_max: 150000
+  - name: "RX 6600"
+    aliases: ["rx 6600", "rx6600"]
+    excellent_max: 75000
+    normal_max: 90000
+
+# Это исключается полностью: не сама дискретная видеокарта.
+hard_excluded_keywords:
+  - "laptop"
+  - "ноутбук"
+  - "майнинг ферма"
+  - "ферма"
+  - "нерабочая"
+  - "не включается"
+  - "на запчасти"
+  - "только чип"
+  # Профессиональные / серверные карты, не предназначенные для игрового поиска.
+  - "nvidia t400"
+  - "nvidia t600"
+  - "nvidia t1000"
+  - "nvidia t4000"
+  - "rtx pro"
+  - "rtx a"
+  - "quadro"
+  - "tesla"
+  - "workstation"
+  - "data center"
+  - "дата-центр"
+
+# Это не исключается: бот пришлёт объявление с предупреждением ⚠️.
+risk_keywords: ["после майнинга", "майнинг", "артефакт", "ремонт", "без проверки", "не тестировал", "неисправ"]
+
+# Если найдено хотя бы одно слово, это комплектующая/аксессуар, а не сама видеокарта.
+# Проверяется и заголовок, и описание.
+excluded_any_keywords:
+  - "водоблок"
+  - "water block"
+  - "backplate"
+  - "кулер"
+  - "кулеры"
+  - "вентилятор"
+  - "вентиляторы"
+  - "термопроклад"
+  - "радиатор"
+  - "кожух"
+  - "шлейф"
+  - "запчаст"
+  - "держатель"
+  - "sli мост"
+
+# Не присылать уже опубликованные объявления после самого первого запуска.
+# Поменяйте на true, если хотите получить все подходящие объявления сразу.
+notify_existing_on_first_run: false
+
+# Лимит объявлений на одной странице выдачи.
+# OLX отдаёт до ~42 карточек на страницу, при 30 остаток молча терялся.
+max_candidates_per_search: 60
+
+# Каждый профиль — отдельное направление. Пока активны только видеокарты.
+profiles:
+  - id: "gpu"
+    name: "Видеокарты"
+    enabled: true
+  - id: "iphone"
+    name: "iPhone"
+    enabled: false
+    search_urls: []
+    required_any_keywords: ["iphone"]
+    excluded_any_keywords: ["чехол", "стекло", "зарядка", "запчасти"]
+  - id: "monitors"
+    name: "Мониторы"
+    enabled: false
+    search_urls: []
+    required_any_keywords: ["монитор"]
+    excluded_any_keywords: ["кронштейн", "кабель", "матрица", "запчасти"]
