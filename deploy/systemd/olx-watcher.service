@@ -14,10 +14,11 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=olx-watcher
 
-# Тот же потолок памяти, что у tiktokbot: машина уже видела OOM-kill.
-# Обходчик держит в памяти только одну страницу выдачи, ему хватает с запасом.
-MemoryHigh=300M
-MemoryMax=400M
+# Потолок памяти: машина уже видела OOM-kill, поэтому лимит есть, но с запасом.
+# Замер на droid: разбор страницы выдачи (3 МБ HTML, 41 карточка) плюс восемь
+# страниц объявлений дают пик 86 МБ. 512/768M — примерно шестикратный запас.
+MemoryHigh=512M
+MemoryMax=768M
 
 [Install]
 WantedBy=multi-user.target
