@@ -81,7 +81,8 @@ def rows_table(rows: list[sqlite3.Row], notes: dict[str, str], show_reason: bool
             f"<tr><td>{escape(r['profile_id'])}</td>"
             f"<td><a href='{escape(r['url'], quote=True)}' target=_blank rel=noopener>{escape(r['title'] or '—')}</a>"
             f"{f'<br><small>{escape(note)}</small>' if note else ''}</td>"
-            f"<td>{escape(r['model'] or '—')}</td>"
+            f"<td>{escape(r['model'] or '—')}"
+            f"{'' if r['telegram_message_id'] else '<br><small>не отправлено</small>'}</td>"
             f"<td>{price}<br><a href='/price/{escape(r['ad_id'], quote=True)}' target=_blank><small>история</small></a></td>"
             f"<td>{status}</td><td>{escape(r['seller_name'] or '—')}</td><td>{escape(r['risk_flags'] or '—')}</td></tr>")
     return f"<table>{head}{''.join(cells)}</table>"
@@ -126,7 +127,13 @@ def rejected():
 
 @app.get("/passed")
 def passed():
-    return listing_page("Прошли фильтр", "/passed", "reject_reason = '' AND telegram_message_id IS NOT NULL", [], show_reason=False)
+    """Всё, что проходит фильтр сейчас — включая не отправленное.
+
+    Отправку не требуем: после смены правил часть объявлений проходит, но
+    просмотрена была при старых фильтрах и в Telegram не попала. Такие видны
+    здесь с пометкой «не отправлено» — иначе они пропали бы из виду совсем.
+    """
+    return listing_page("Прошли фильтр", "/passed", "reject_reason = ''", [], show_reason=False)
 
 
 @app.get("/all")
