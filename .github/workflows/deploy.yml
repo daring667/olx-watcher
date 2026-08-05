@@ -78,14 +78,21 @@ jobs:
           cd /home/droid/olx/olx-watcher
           ./venv/bin/pip install -q -r requirements.txt
 
-      - name: Restart watcher service
-        run: sudo systemctl restart olx-watcher.service
+      - name: Restart services
+        run: |
+          sudo systemctl restart olx-watcher.service
+          sudo systemctl restart olx-dashboard.service
 
       - name: Wait for startup
         run: sleep 5
 
-      - name: Verify service is active
-        run: sudo systemctl is-active olx-watcher.service
+      - name: Verify services are active
+        run: |
+          sudo systemctl is-active olx-watcher.service
+          sudo systemctl is-active olx-dashboard.service
+
+      - name: Verify the dashboard actually answers
+        run: curl -fsS -o /dev/null http://127.0.0.1:5050/
 
       - name: Show recent logs on failure
         if: failure()

@@ -187,6 +187,44 @@ def assess(listing: Listing, config: dict) -> Listing:
     return replace(listing, model=matched_model.get("name") if matched_model else None, risk_flags=", ".join(risks))
 
 
+def price_limit(listing: Listing, config: dict) -> int:
+    """Потолок для объявления. Для распознанной модели — её normal_max, иначе
+    общий max_price_kzt. Раньше normal_max влиял только на текст подписи, а
+    отсекал всегда max_price_kzt: RTX 4060 с ориентиром 150 000 не проходила
+    при потолке 100 000 и не могла прийти никогда."""
+    model = next((item for item in config.get("models", []) if item.get("name") == listing.model), None)
+    return int(model["normal_max"]) if model else int(config["max_price_kzt"])
+
+
+def evaluate(listing: Listing, config: dict) -> str:
+    """Причина отсева или пустая строка, если объявление проходит.
+
+    Единственное место, где решается судьба объявления: и боевой цикл, и
+    --debug зовут именно его. Раньше условия были выписаны в двух местах
+    по-разному, и отладка показывала не то, что реально уходило в Telegram.
+    """
+    content = f"{listing.title} {listing.description}".casefold()
+    title = (listing.title or "").casefold()
+    for word in config.get("hard_excluded_keywords", []):
+        if word.casefold() in content:
+            return f"стоп-слово: {word}"
+    # Аксессуары ищем ТОЛЬКО в заголовке. В описании настоящей видеокарты
+    # «вентилятор», «кулер», «радиатор» и «термопрокладки» встречаются постоянно
+    # — это рассказ про систему охлаждения. По описанию так терялось около 60
+    # живых карт, а сам аксессуар всегда заявляет себя в заголовке.
+    for word in config.get("excluded_any_keywords", []):
+        if word.casefold() in title:
+            return f"комплектующая: {word}"
+    if not any(word.casefold() in content for word in config["required_any_keywords"]) and not listing.model:
+        return "нет ключевого слова"
+    if listing.price_kzt is None:
+        return "цена не распознана"
+    limit = price_limit(listing, config)
+    if listing.price_kzt > limit:
+        return f"дороже потолка {limit:,} ₸"
+    return ""
+
+
 def price_label(listing: Listing, config: dict) -> str:
     model = next((item for item in config.get("models", []) if item.get("name") == listing.model), None)
     if not model or listing.price_kzt is None:
@@ -212,7 +250,7 @@ class Storage:
               price_kzt INTEGER, image_url TEXT, search_url TEXT, status TEXT NOT NULL DEFAULT 'new',
               first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, telegram_message_id INTEGER,
               model TEXT, risk_flags TEXT, seller_name TEXT, seller_since TEXT, deal_status TEXT NOT NULL DEFAULT 'new'
-              , profile_id TEXT NOT NULL DEFAULT 'gpu'
+              , profile_id TEXT NOT NULL DEFAULT 'gpu', reject_reason TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY AUTOINCREMENT, ad_id TEXT NOT NULL, created_at INTEGER NOT NULL, body TEXT NOT NULL);
@@ -229,6 +267,7 @@ class Storage:
             "model": "TEXT", "risk_flags": "TEXT", "seller_name": "TEXT", "seller_since": "TEXT",
             "deal_status": "TEXT NOT NULL DEFAULT 'new'",
             "profile_id": "TEXT NOT NULL DEFAULT 'gpu'",
+            "reject_reason": "TEXT NOT NULL DEFAULT ''",
         }.items():
             if name not in existing:
                 self.connection.execute(f"ALTER TABLE ads ADD COLUMN {name} {definition}")
@@ -258,13 +297,13 @@ class Storage:
         )
         self.connection.commit()
 
-    def add_new(self, listing: Listing) -> None:
+    def add_new(self, listing: Listing, reject_reason: str = "") -> None:
         now = int(time.time())
         self.connection.execute(
-            "INSERT INTO ads(ad_id,url,title,description,price_kzt,image_url,search_url,status,first_seen,last_seen,model,risk_flags,seller_name,seller_since,profile_id) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO ads(ad_id,url,title,description,price_kzt,image_url,search_url,status,first_seen,last_seen,model,risk_flags,seller_name,seller_since,profile_id,reject_reason) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (listing.ad_id, listing.url, listing.title, listing.description, listing.price_kzt, listing.image_url,
-             listing.search_url, 'new', now, now, listing.model, listing.risk_flags, listing.seller_name, listing.seller_since, listing.profile_id),
+             listing.search_url, 'new', now, now, listing.model, listing.risk_flags, listing.seller_name, listing.seller_since, listing.profile_id, reject_reason),
         )
         self.connection.execute("INSERT INTO price_history(ad_id,recorded_at,price_kzt) VALUES(?,?,?)", (listing.ad_id, now, listing.price_kzt))
         self.connection.commit()
@@ -608,18 +647,48 @@ def load_config() -> dict:
 
 def debug_once(config: dict, count: int) -> None:
     session = olx_session()
-    keywords = tuple(word.casefold() for word in config["required_any_keywords"])
-    excluded = tuple(word.casefold() for word in config.get("excluded_any_keywords", []))
-    hard_excluded = tuple(word.casefold() for word in config.get("hard_excluded_keywords", []))
     for search_url in config["search_urls"]:
         response = session.get(search_url, timeout=25); response.raise_for_status()
         for number, brief in enumerate(extract_listings(search_url, response.text, count), 1):
             listing = assess(fetch_details(session, brief), config)
-            content = f"{listing.title} {listing.description}".casefold()
-            matches = [word for word in keywords if word in content]
-            rejected = [word for word in excluded if word in content]
-            fits = bool(matches) and not rejected and not any(word in content for word in hard_excluded) and listing.price_kzt is not None and listing.price_kzt <= int(config["max_price_kzt"])
-            print(f"{number}. {'ПОДХОДИТ' if fits else 'не подходит'} | {listing.price_kzt} ₸ | совпало: {', '.join(matches) or 'нет'} | исключено: {', '.join(rejected) or 'нет'}\n   {listing.url}")
+            reason = evaluate(listing, config)
+            verdict = "ПОДХОДИТ" if not reason else f"не подходит ({reason})"
+            model = listing.model or "не определена"
+            print(f"{number}. {verdict} | {listing.price_kzt} ₸ | модель: {model} | потолок: {price_limit(listing, config):,} ₸\n   {listing.title[:70]}\n   {listing.url}")
+
+
+def backfill_reasons(config: dict) -> None:
+    """Проставляет причину отсева уже накопленным объявлениям.
+
+    reject_reason заполняется только при добавлении нового объявления, поэтому
+    без пересчёта экран отсеянных был бы пуст до следующего наплыва объявлений.
+    Ничего не скачивает: считает по сохранённым заголовку и описанию.
+    """
+    storage = Storage()
+    try:
+        rows = storage.connection.execute("SELECT * FROM ads").fetchall()
+        by_profile = {p["id"]: {**config, **p} for p in config.get("profiles", [])}
+        updated = 0
+        for row in rows:
+            listing = assess(Listing(
+                row["ad_id"], row["url"], row["title"] or "", row["price_kzt"],
+                row["description"] or "", profile_id=row["profile_id"],
+            ), by_profile.get(row["profile_id"], config))
+            reason = evaluate(listing, by_profile.get(row["profile_id"], config))
+            if reason != (row["reject_reason"] or ""):
+                storage.connection.execute(
+                    "UPDATE ads SET reject_reason=?, model=COALESCE(?,model) WHERE ad_id=?",
+                    (reason, listing.model, row["ad_id"]))
+                updated += 1
+        storage.connection.commit()
+        passed = sum(1 for r in storage.connection.execute("SELECT reject_reason FROM ads") if not r["reject_reason"])
+        print(f"Пересчитано {len(rows)} объявлений, обновлено {updated}. Проходят фильтр: {passed}.")
+        print("\nПричины отсева:")
+        for r in storage.connection.execute(
+                "SELECT reject_reason r, COUNT(*) c FROM ads WHERE reject_reason != '' GROUP BY r ORDER BY c DESC"):
+            print(f"  {r['c']:>4}  {r['r']}")
+    finally:
+        storage.close()
 
 
 def print_favorites() -> None:
@@ -657,9 +726,6 @@ def main(debug_count: int | None = None) -> None:
             profiles = [p for p in profiles if storage.setting(f"profile_enabled:{p['id']}", "1" if p.get("enabled", True) else "0") == "1"]
             for profile in profiles:
                 profile_config = {**config, **profile}
-                keywords = tuple(word.casefold() for word in profile_config["required_any_keywords"])
-                excluded = tuple(word.casefold() for word in profile_config.get("excluded_any_keywords", []))
-                hard_excluded = tuple(word.casefold() for word in profile_config.get("hard_excluded_keywords", []))
                 for search_url in profile_config.get("search_urls", []):
                     page_number, cycle_ids = 1, set()
                     while max_pages == 0 or page_number <= max_pages:
@@ -689,12 +755,9 @@ def main(debug_count: int | None = None) -> None:
                                 storage.add_baseline(replace(brief, profile_id=profile_config["id"])); continue
                             try:
                                 listing = assess(fetch_details(session, replace(brief, profile_id=profile_config["id"])), profile_config)
-                                storage.add_new(listing)
-                                content = f"{listing.title} {listing.description}".casefold()
-                                words = [word for word in keywords if word in content]
-                                if ((words or listing.model) and not any(word in content for word in excluded)
-                                        and not any(word in content for word in hard_excluded)
-                                        and listing.price_kzt is not None and listing.price_kzt <= int(profile_config["max_price_kzt"])):
+                                reason = evaluate(listing, profile_config)
+                                storage.add_new(listing, reason)
+                                if not reason:
                                     notify(token, chat_id, listing, storage, profile_config); matched += 1
                             except NETWORK_ERRORS as error:
                                 storage.record_error("Карточка объявления OLX", error, brief)
@@ -723,6 +786,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="OLX-помощник с Telegram-избранным")
     parser.add_argument("--debug", type=int, metavar="N", help="один раз проверить N карточек без сохранения")
     parser.add_argument("--favorites", action="store_true", help="вывести избранное в терминал, от дешёвых к дорогим")
+    parser.add_argument("--backfill-reasons", action="store_true", help="пересчитать причины отсева для уже сохранённых объявлений")
     args = parser.parse_args()
     ROOT.joinpath("data").mkdir(exist_ok=True)
     formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
@@ -731,6 +795,11 @@ if __name__ == "__main__":
     error_file.setLevel(logging.WARNING); error_file.setFormatter(formatter)
     logging.basicConfig(level=logging.INFO, handlers=[console, error_file])
     try:
-        print_favorites() if args.favorites else main(args.debug)
+        if args.favorites:
+            print_favorites()
+        elif args.backfill_reasons:
+            backfill_reasons(load_config())
+        else:
+            main(args.debug)
     except KeyboardInterrupt:
         sys.exit(0)

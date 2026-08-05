@@ -1,0 +1,26 @@
+[Unit]
+Description=OLX Watcher Dashboard
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{RUN_USER}}
+WorkingDirectory={{PROJECT_DIR}}
+# Адрес Tailscale, а не 0.0.0.0: панель открывается с любого вашего устройства
+# в сети Tailscale и при этом не выставлена ни в интернет, ни в домашнюю сеть.
+# Пароля поэтому нет — доступ ограничен на сетевом уровне.
+# Localhost в списке нужен healthcheck-у в CI.
+Environment=DASHBOARD_LISTEN=127.0.0.1:5050 {{TAILSCALE_IP}}:5050
+ExecStart={{PROJECT_DIR}}/venv/bin/python dashboard.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=olx-dashboard
+
+MemoryHigh=256M
+MemoryMax=384M
+
+[Install]
+WantedBy=multi-user.target
