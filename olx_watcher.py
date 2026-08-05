@@ -158,14 +158,20 @@ def fetch_details(session: requests.Session, listing: Listing) -> Listing:
     og_title = soup.select_one('meta[property="og:title"]')
     title = listing.title or text(heading) or (og_title.get("content", "") if og_title else "")
     image = soup.select_one('meta[property="og:image"]')
-    price_node = soup.select_one('[data-testid="ad-price"], [data-cy="ad_price"]')
+    price_node = soup.select_one(
+        '[data-testid="ad-price-container"], [data-testid="prices-wrapper"], '
+        '[data-testid="ad-price"], [data-cy="ad_price"]'
+    )
     seller_node = soup.select_one('[data-cy="seller_name"], [data-testid="seller-name"], a[href*="/user/"]')
     seller_name = text(seller_node) or None
     raw_text = soup.get_text(" ", strip=True)
     since = re.search(r"(?:На OLX с|Зарегистрирован(?:а)?)[\s:]+([^|.]{3,40})", raw_text, re.IGNORECASE)
     return Listing(
         listing.ad_id, listing.url, title,
-        extract_price(text(price_node)) or listing.price_kzt or extract_price(raw_text),
+        # Никакого запасного разбора всего текста страницы: он цеплял случайное
+        # число из блока похожих объявлений и записывал RTX 2080 по 6 130 000 ₸.
+        # Лучше оставить цену пустой — такое объявление просто не пройдёт фильтр.
+        extract_price(text(price_node)) or listing.price_kzt,
         description, image.get("content") if image else listing.image_url, listing.search_url,
         seller_name=seller_name, seller_since=since.group(1).strip() if since else None, profile_id=listing.profile_id,
     )
