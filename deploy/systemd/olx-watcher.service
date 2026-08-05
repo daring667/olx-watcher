@@ -1,0 +1,23 @@
+[Unit]
+Description=OLX to Telegram Watcher
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{RUN_USER}}
+WorkingDirectory={{PROJECT_DIR}}
+ExecStart={{PROJECT_DIR}}/venv/bin/python olx_watcher.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=olx-watcher
+
+# Тот же потолок памяти, что у tiktokbot: машина уже видела OOM-kill.
+# Обходчик держит в памяти только одну страницу выдачи, ему хватает с запасом.
+MemoryHigh=300M
+MemoryMax=400M
+
+[Install]
+WantedBy=multi-user.target

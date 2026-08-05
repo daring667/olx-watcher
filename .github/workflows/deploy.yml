@@ -1,0 +1,85 @@
+name: Test and deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - run: pip install -r requirements.txt
+
+      # Юнит-тестов в проекте пока нет. Проверяем то, что реально ломалось:
+      # модули импортируются, конфиг — валидный YAML, а парсер цены не
+      # склеивает номер модели с ценой (та самая ошибка «GT730 6 000 тг»).
+      - name: Import and config check
+        run: |
+          python -c "import olx_watcher, dashboard"
+          python -c "import yaml; yaml.safe_load(open('config.example.yaml', encoding='utf-8'))"
+
+      - name: Price parser regression
+        run: |
+          python - <<'EOF'
+          from olx_watcher import extract_price
+          cases = {
+              "GT730 6 000 тг": 6000,
+              "RTX 3060 90 000 ₸": 90000,
+              "Видеокарта 2 250 000 ₸": 2250000,
+              "45000 тг": 45000,
+              "Цена договорная": None,
+              "RTX 3080 $600": None,
+          }
+          for text, expected in cases.items():
+              actual = extract_price(text)
+              assert actual == expected, f"{text!r}: получено {actual}, ожидалось {expected}"
+          print(f"{len(cases)} проверок парсера цены пройдено")
+          EOF
+
+  deploy:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, droid]
+    steps:
+      - name: Pull latest code
+        run: |
+          cd /home/droid/olx/olx-watcher
+          git fetch origin main
+
+          # `git reset --hard` ниже молча затёр бы правки трекаемых файлов,
+          # сделанные прямо на сервере. Сначала прячем их в stash, чтобы
+          # ничего не пропало бесследно — вернуть можно `git stash list/pop`.
+          if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+            STASH_LABEL="ci-autostash-$(date -u +%Y%m%d-%H%M%S)"
+            echo "::warning::На сервере есть локальные правки, прячу их как $STASH_LABEL"
+            git status --short --untracked-files=no
+            git stash push -m "$STASH_LABEL"
+          fi
+
+          git reset --hard origin/main
+
+      - name: Install dependencies
+        run: |
+          cd /home/droid/olx/olx-watcher
+          ./venv/bin/pip install -q -r requirements.txt
+
+      - name: Restart watcher service
+        run: sudo systemctl restart olx-watcher.service
+
+      - name: Wait for startup
+        run: sleep 5
+
+      - name: Verify service is active
+        run: sudo systemctl is-active olx-watcher.service
+
+      - name: Show recent logs on failure
+        if: failure()
+        run: sudo journalctl -u olx-watcher.service -n 50 --no-pager
