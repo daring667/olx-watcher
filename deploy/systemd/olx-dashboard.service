@@ -11,7 +11,9 @@ WorkingDirectory={{PROJECT_DIR}}
 # в сети Tailscale и при этом не выставлена ни в интернет, ни в домашнюю сеть.
 # Пароля поэтому нет — доступ ограничен на сетевом уровне.
 # Localhost в списке нужен healthcheck-у в CI.
-Environment=DASHBOARD_LISTEN=127.0.0.1:5050 {{TAILSCALE_IP}}:5050
+# Кавычки обязательны: без них systemd обрезает значение по первому пробелу
+# и панель поднимается только на localhost.
+Environment="DASHBOARD_LISTEN=127.0.0.1:5050 {{TAILSCALE_IP}}:5050"
 ExecStart={{PROJECT_DIR}}/venv/bin/python dashboard.py
 Restart=on-failure
 RestartSec=10
