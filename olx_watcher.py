@@ -75,7 +75,9 @@ def text(node) -> str:
 # Цена — это либо группы по три цифры («2 250 000 ₸»), либо одно число («45000 ₸»).
 # Строгие тройки не дают склеить номер модели с ценой: в «GT730 6 000 тг»
 # захватывается «6 000», а не «730 6 000».
-PRICE_PATTERN = re.compile(r"(\d{1,3}(?:[\s\u00a0]\d{3})+|\d+)\s*(?:₸|тг\.?|тенге)")
+# (?<!\d) обязателен: без него поиск стартует с середины числа и в
+# «rx 6800 200 000 тг» захватывает «800 200 000» вместо «200 000».
+PRICE_PATTERN = re.compile(r"(?<!\d)(\d{1,3}(?:[\s\u00a0]\d{3})+|\d+)\s*(?:₸|тг\.?|тенге)")
 
 
 def extract_price(value: str) -> int | None:
@@ -697,8 +699,14 @@ def main(debug_count: int | None = None) -> None:
                                 logging.exception("Ошибка при обработке %s", brief.ad_id)
                         logging.info("%s · страница %d: карточек %d; новых %d", profile_config.get("name", profile_config["id"]), page_number, len(cards), page_new)
                         page_number += 1; stop.wait(page_delay)
-            if first_run:
+            # Закрываем baseline только если обход действительно что-то прочитал.
+            # Полностью неудачный первый прогон (например, 403 от OLX) иначе
+            # помечал бы базу построенной вхолостую, и следующий цикл разослал
+            # бы всю выдачу как новинки.
+            if first_run and scanned:
                 storage.connection.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('baseline_completed','1')"); storage.connection.commit(); first_run = False
+            elif first_run:
+                logging.warning("Первый обход не прочитал ни одного объявления; baseline не закрыт, повторю в следующем цикле")
             logging.info("ИТОГ ПРОГОНА: просмотрено=%d, новых=%d, отправлено=%d, время=%.1f сек.", scanned, new, matched, time.monotonic() - started)
             stop.wait(int(config["poll_interval_seconds"]))
     finally:
