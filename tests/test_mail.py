@@ -39,6 +39,33 @@ def test_parses_sender_advert_and_link():
     assert parsed["link"] == "https://www.olx.kz/myaccount/messages/thread/123"
 
 
+# Настоящее письмо OLX.kz: ни имени собеседника, ни названия объявления,
+# ни текста сообщения — только ссылка на переписку.
+REAL_LETTER = letter(
+    "Пришел новый ответ на объявление",
+    "Пришел новый ответ на объявление\n"
+    "https://www.olx.kz/myaccount/answer/2e53204f-502c-4086-8130-4e554f113887/"
+    "?action=answer&id=2e53204f-502c-4086-8130-4e554f113887&my_chat=1#last\n"
+    "Это сообщение было отправлено автоматически. Пожалуйста, не отвечайте на него.\n")
+
+
+def test_real_olx_letter_is_recognised():
+    parsed = olx_mail.parse_notification(REAL_LETTER)
+    assert olx_mail.looks_like_message_notification(parsed) is True
+    assert parsed["link"].startswith("https://www.olx.kz/myaccount/answer/")
+
+
+def test_real_olx_letter_has_no_invented_fields():
+    """Чего в письме нет, того не должно появиться: ни отправителя, ни объявления.
+
+    Разделитель перед названием ловил перевод строки, и в поле «объявление»
+    попадала следующая строка — сначала ссылка, потом повтор темы.
+    """
+    parsed = olx_mail.parse_notification(REAL_LETTER)
+    assert parsed["sender"] == ""
+    assert parsed["advert"] == ""
+
+
 def test_recognised_as_message_notification():
     assert olx_mail.looks_like_message_notification(
         olx_mail.parse_notification(MESSAGE_LETTER)) is True

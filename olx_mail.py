@@ -73,8 +73,13 @@ def decode(value: str | None) -> str:
         return value
 
 
-def plain_text(message: Message) -> str:
-    """Текст письма: сначала text/plain, иначе HTML без разметки."""
+def message_parts(message: Message) -> tuple[str, str]:
+    """Текстовая и HTML-часть письма по отдельности.
+
+    Уведомление OLX в text/plain содержит только ссылку, поэтому название
+    объявления и имя собеседника, если они вообще есть, приходится искать
+    в HTML-версии — нужны обе части.
+    """
     plain, rich = "", ""
     for part in message.walk():
         if part.get_content_maintype() != "text":
@@ -90,11 +95,16 @@ def plain_text(message: Message) -> str:
             plain = text
         elif part.get_content_subtype() == "html" and not rich:
             rich = text
-    if plain:
-        return plain
     rich = re.sub(r"(?is)<(script|style).*?</\1>", " ", rich)
-    rich = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</tr>", "\n", rich)
-    return html.unescape(re.sub(r"<[^>]+>", " ", rich))
+    rich = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</tr>|</h\d>", "\n", rich)
+    rich = html.unescape(re.sub(r"<[^>]+>", " ", rich))
+    return plain, rich
+
+
+def plain_text(message: Message) -> str:
+    """Текст письма: сначала text/plain, иначе HTML без разметки."""
+    plain, rich = message_parts(message)
+    return plain or rich
 
 
 def tidy(text: str) -> str:
@@ -109,27 +119,36 @@ def parse_notification(message: Message) -> dict[str, str]:
     вариантов подряд, а --dump показывает исходник, если что-то не совпало.
     """
     subject = decode(message.get("Subject"))
-    body = tidy(plain_text(message))
+    plain, rich = message_parts(message)
+    body = tidy(plain) or tidy(rich)
+    # Ищем по обеим частям: в text/plain у OLX только ссылка, а название
+    # объявления и имя собеседника, если они вообще есть, лежат в HTML.
+    searchable = f"{subject}\n{tidy(plain)}\n{tidy(rich)}"
 
     sender = ""
-    for pattern in (r"(?:новое сообщение|сообщение)\s+от\s+([^\n,.:]{2,40})",
+    for pattern in (r"(?:новое сообщение|сообщение|ответ)\s+от\s+([^\n,.:]{2,40})",
                     r"(?:new message)\s+from\s+([^\n,.:]{2,40})",
-                    r"^([^\n]{2,40})\s+(?:написал|отправил)"):
-        found = re.search(pattern, f"{subject}\n{body}", re.IGNORECASE | re.MULTILINE)
+                    r"^([^\n]{2,40})\s+(?:написал|отправил|ответил)"):
+        found = re.search(pattern, searchable, re.IGNORECASE | re.MULTILINE)
         if found:
             sender = found.group(1).strip()
             break
 
     advert = ""
-    for pattern in (r"(?:по объявлению|объявление|к объявлению)[:\s»\"]*([^\n]{3,80})",
-                    r"(?:regarding|about)[:\s]+([^\n]{3,80})"):
-        found = re.search(pattern, body, re.IGNORECASE)
+    # Разделитель без \s: иначе он перепрыгивал перевод строки и названием
+    # объявления становилась следующая строка письма — то ссылка, то повтор
+    # темы. В уведомлении OLX названия нет вовсе, и пустое поле здесь честнее.
+    for pattern in (r"(?:по объявлению|к объявлению|объявление)[ \t:»\"]*([^\n]{3,80})",
+                    r"(?:regarding|about)[ \t:]+([^\n]{3,80})"):
+        found = re.search(pattern, searchable, re.IGNORECASE)
         if found:
-            advert = found.group(1).strip(" «»\"")
-            break
+            candidate = found.group(1).strip(" «»\"")
+            if candidate and not candidate.lower().startswith("http"):
+                advert = candidate
+                break
 
     link = ""
-    found = re.search(r"https?://[^\s\"'<>]*olx\.[a-z]{2,3}/[^\s\"'<>]*", body, re.IGNORECASE)
+    found = re.search(r"https?://[^\s\"'<>]*olx\.[a-z]{2,3}/[^\s\"'<>]*", searchable, re.IGNORECASE)
     if found:
         link = found.group(0)
 
@@ -268,7 +287,9 @@ def dump() -> None:
             print(f"объявление: {parsed['advert'] or '— не распознано'}")
             print(f"ссылка:     {parsed['link'] or '—'}")
             print(f"это сообщение? {looks_like_message_notification(parsed)}")
-            print(f"--- текст (600) ---\n{parsed['body'][:600]}")
+            plain, rich = message_parts(message)
+            print(f"--- text/plain ({len(plain)} симв.) ---\n{tidy(plain)[:500] or '(пусто)'}")
+            print(f"--- text/html как текст ({len(rich)} симв.) ---\n{tidy(rich)[:900] or '(пусто)'}")
     finally:
         mailbox.logout()
 
