@@ -1,0 +1,21 @@
+[Unit]
+Description=OLX chat messages to Telegram
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{RUN_USER}}
+WorkingDirectory={{PROJECT_DIR}}
+ExecStart={{PROJECT_DIR}}/venv/bin/python olx_messages.py --interval 120
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=olx-messages
+
+MemoryHigh=200M
+MemoryMax=300M
+
+[Install]
+WantedBy=multi-user.target

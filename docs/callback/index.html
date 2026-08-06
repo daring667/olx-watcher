@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OLX Watcher — код авторизации</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 16px/1.5 system-ui, -apple-system, sans-serif; margin: 0;
+         min-height: 100vh; display: grid; place-items: center; padding: 24px;
+         background: #f6f7fb; color: #1a1d24; }
+  .card { background: #fff; border: 1px solid #e6e8ee; border-radius: 12px;
+          padding: 28px; max-width: 620px; width: 100%; }
+  h1 { font-size: 20px; margin: 0 0 6px; }
+  p { color: #555; margin: 8px 0; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .code { display: block; background: #eef0f6; border-radius: 8px; padding: 14px;
+          margin: 16px 0; word-break: break-all; font-size: 15px; user-select: all; }
+  button { font: inherit; padding: 9px 16px; border: 0; border-radius: 8px;
+           background: #1769e0; color: #fff; cursor: pointer; }
+  button:disabled { background: #7aa7e8; cursor: default; }
+  .cmd { background: #1a1d24; color: #e6e8ee; border-radius: 8px; padding: 14px;
+         margin-top: 16px; overflow-x: auto; font-size: 13px; }
+  .error { color: #b3261e; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #14161c; color: #e6e8ee; }
+    .card { background: #1d2029; border-color: #2c3140; }
+    p { color: #98a0b3; }
+    .code { background: #242833; }
+  }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Код авторизации OLX</h1>
+  <div id="content"><p>Читаю адрес…</p></div>
+</div>
+<script>
+// Страница ничего никуда не отправляет: код авторизации остаётся в адресной
+// строке вашего браузера, здесь он только показывается для копирования.
+// Обмен кода на токены делает бот на сервере — client_secret нужен именно там
+// и в браузер не попадает.
+(function () {
+  var params = new URLSearchParams(location.search);
+  var code = params.get('code');
+  var error = params.get('error');
+  var target = document.getElementById('content');
+
+  if (error) {
+    target.innerHTML = '<p class="error">OLX вернул ошибку: <code></code></p>' +
+      '<p>Попробуйте пройти авторизацию заново.</p>';
+    target.querySelector('code').textContent =
+      error + (params.get('error_description') ? ' — ' + params.get('error_description') : '');
+    return;
+  }
+  if (!code) {
+    target.innerHTML = '<p>В адресе нет параметра <code>code</code>. ' +
+      'Откройте ссылку авторизации, которую напечатал бот, и разрешите доступ.</p>';
+    return;
+  }
+
+  target.innerHTML =
+    '<p>Скопируйте код и выполните команду на сервере. Код одноразовый и живёт недолго.</p>' +
+    '<code class="code" id="code"></code>' +
+    '<button id="copy">Скопировать код</button>' +
+    '<div class="cmd">ssh droid \'cd /home/droid/olx/olx-watcher &amp;&amp; ' +
+    './venv/bin/python olx_messages.py --auth-code <span id="inline"></span>\'</div>';
+  document.getElementById('code').textContent = code;
+  document.getElementById('inline').textContent = code;
+
+  document.getElementById('copy').addEventListener('click', function () {
+    var button = this;
+    navigator.clipboard.writeText(code).then(function () {
+      button.textContent = 'Скопировано';
+      button.disabled = true;
+    });
+  });
+})();
+</script>
+</body>
+</html>
