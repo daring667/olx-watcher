@@ -1,0 +1,12 @@
+[Unit]
+Description=OLX Watcher database backup
+After=network.target
+
+[Service]
+Type=oneshot
+User={{RUN_USER}}
+WorkingDirectory={{PROJECT_DIR}}
+ExecStart={{PROJECT_DIR}}/venv/bin/python deploy/backup.py
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=olx-backup

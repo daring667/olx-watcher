@@ -1,17 +1,24 @@
 # Ссылку выдачи откройте на OLX вручную: выберите Алматы, «Видеокарты»,
 # сортировку «Сначала новые», затем скопируйте адрес из браузера сюда.
+# search[dist]=30 — Алматы плюс область в радиусе 30 км. Радиус сохраняется
+# при переходе по страницам, отдельная ссылка на пригород не нужна.
 search_urls:
-  - "https://www.olx.kz/d/elektronika/kompyutery-i-komplektuyuschie/komplektuyuschie-i-aksesuary/videokarty/alma-ata/"
+  - "https://www.olx.kz/d/elektronika/kompyutery-i-komplektuyuschie/komplektuyuschie-i-aksesuary/videokarty/alma-ata/?search%5Bdist%5D=30"
 
 # Полный обход категории требует паузы между циклами, чтобы не перегружать OLX.
-poll_interval_seconds: 1800
+poll_interval_seconds: 3600
 # 0 = идти до первой пустой страницы. Для ограничения обхода укажите число страниц.
 max_pages_per_search: 0
 # Небольшая пауза между страницами выдачи.
 page_delay_seconds: 1.5
 daily_summary_time: "21:00"
 # Единственный потолок цены — для всех карт, независимо от модели.
-max_price_kzt: 100000
+max_price_kzt: 50000
+
+# Сколько обходов подряд объявление должно отсутствовать в выдаче, чтобы
+# считаться снятым. При обходе раз в час три цикла — это три часа: разовый
+# сбой сети или пропуск страницы отметку не вызовет.
+missing_cycles_before_gone: 3
 
 # Ищем ВЕНДОРА, а не модель: любая карта NVIDIA, решает цена.
 # Серия GT (GT 710, GT 1030 и подобные) сознательно не включена — слишком старая.

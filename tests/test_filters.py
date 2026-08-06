@@ -12,11 +12,16 @@ import yaml
 from olx_watcher import (Listing, assess, clean_seller_name, evaluate, extract_price,
                          is_mining_card, model_number_in, price_label, price_limit)
 
-CONFIG = yaml.safe_load((Path(__file__).resolve().parent.parent / "config.example.yaml")
-                        .read_text(encoding="utf-8"))
+REAL_CONFIG = yaml.safe_load((Path(__file__).resolve().parent.parent / "config.example.yaml")
+                             .read_text(encoding="utf-8"))
+
+# Бюджет — настройка, которая меняется по желанию владельца, и привязывать к
+# ней проверки правил нельзя: снижение потолка со 100 000 до 50 000 уронило
+# шесть тестов, хотя ни одно правило не менялось. Потолок проверяется отдельно.
+CONFIG = {**REAL_CONFIG, "max_price_kzt": 100000}
 
 
-def ad(title: str, price: int | None = 50000, description: str = "") -> Listing:
+def ad(title: str, price: int | None = 30000, description: str = "") -> Listing:
     return assess(Listing("ID1", "https://olx.kz/ad", title, price, description), CONFIG)
 
 
@@ -107,6 +112,15 @@ def test_price_ceiling_is_single():
     assert price_limit(ad("Видеокарта без модели", 1), CONFIG) == limit
 
 
+def test_real_budget_is_applied():
+    """Потолок из рабочего конфига действительно отсекает — на реальном значении."""
+    budget = int(REAL_CONFIG["max_price_kzt"])
+    cheap = assess(Listing("ID1", "u", "Видеокарта GTX 1660 6GB", budget - 1000, ""), REAL_CONFIG)
+    pricey = assess(Listing("ID2", "u", "Видеокарта GTX 1660 6GB", budget + 1000, ""), REAL_CONFIG)
+    assert evaluate(cheap, REAL_CONFIG) == ""
+    assert evaluate(pricey, REAL_CONFIG).startswith("дороже потолка")
+
+
 # --- Модель и подпись -------------------------------------------------------
 def test_model_from_bare_number():
     assert ad("Видеокарта Gigabyte 1080 8GB", 60000).model == "GTX 1080"
@@ -157,6 +171,79 @@ def test_foreign_chat_is_ignored(tmp_path, monkeypatch):
         owner = {"update_id": 2, "message": {"chat": {"id": 12345}, "text": "/favorites"}}
         olx_watcher.handle_update("token", storage, owner, "12345")
         assert len(calls) == 1
+    finally:
+        storage.close()
+
+
+# --- Снятые с публикации ----------------------------------------------------
+def storage_with(tmp_path, ads):
+    import olx_watcher
+    storage = olx_watcher.Storage(tmp_path / "gone.sqlite3")
+    for ad_id, url in ads:
+        storage.add_baseline(Listing(ad_id, "https://olx.kz/a", "Карта", 30000, search_url=url))
+    return storage
+
+
+def test_missing_listing_marked_gone_after_threshold(tmp_path):
+    """Пропало из выдачи трижды подряд — снято. Раньше — ещё нет."""
+    storage = storage_with(tmp_path, [("A", "url1"), ("B", "url1")])
+    try:
+        for expected_gone in (0, 0, 1):   # третий обход переводит порог
+            gone = storage.sweep_missing(["url1"], {"A"}, limit=3)
+            assert gone == expected_gone
+        row = storage.connection.execute("SELECT is_gone FROM ads WHERE ad_id='B'").fetchone()
+        assert row["is_gone"] == 1
+        alive = storage.connection.execute("SELECT is_gone FROM ads WHERE ad_id='A'").fetchone()
+        assert alive["is_gone"] == 0
+    finally:
+        storage.close()
+
+
+def test_reappearing_listing_resets(tmp_path):
+    """Вернулось в выдачу — счётчик обнуляется, отметка снимается."""
+    storage = storage_with(tmp_path, [("A", "url1"), ("B", "url1")])
+    try:
+        for _ in range(3):
+            storage.sweep_missing(["url1"], {"A"}, limit=3)
+        storage.sweep_missing(["url1"], {"A", "B"}, limit=3)
+        row = storage.connection.execute(
+            "SELECT is_gone, missing_cycles FROM ads WHERE ad_id='B'").fetchone()
+        assert (row["is_gone"], row["missing_cycles"]) == (0, 0)
+    finally:
+        storage.close()
+
+
+def test_other_searches_are_untouched(tmp_path):
+    """Обход одного города не объявляет снятыми объявления другого."""
+    storage = storage_with(tmp_path, [("A", "url1"), ("B", "url2")])
+    try:
+        for _ in range(5):
+            storage.sweep_missing(["url1"], {"A"}, limit=3)
+        row = storage.connection.execute(
+            "SELECT is_gone, missing_cycles FROM ads WHERE ad_id='B'").fetchone()
+        assert (row["is_gone"], row["missing_cycles"]) == (0, 0)
+    finally:
+        storage.close()
+
+
+def test_empty_cycle_marks_nothing(tmp_path):
+    """Оборванный обход ничего не отмечает: иначе снятой станет вся база."""
+    storage = storage_with(tmp_path, [("A", "url1"), ("B", "url1")])
+    try:
+        assert storage.sweep_missing(["url1"], set(), limit=3) == 0
+        assert storage.sweep_missing([], {"A"}, limit=3) == 0
+        rows = storage.connection.execute("SELECT SUM(missing_cycles) s FROM ads").fetchone()
+        assert rows["s"] == 0
+    finally:
+        storage.close()
+
+
+def test_url_has_history(tmp_path):
+    """Новая ссылка не должна считаться пройденной — иначе город разошлётся весь."""
+    storage = storage_with(tmp_path, [("A", "url1")])
+    try:
+        assert storage.url_has_history("url1") is True
+        assert storage.url_has_history("url-нового-города") is False
     finally:
         storage.close()
 

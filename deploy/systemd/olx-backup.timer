@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily OLX Watcher database backup
+
+[Timer]
+OnCalendar=*-*-* 04:30:00
+# Машина может быть выключена в назначенный час — тогда копия снимается сразу
+# после включения, а не пропускается до следующих суток.
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

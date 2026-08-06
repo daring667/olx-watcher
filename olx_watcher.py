@@ -324,7 +324,8 @@ class Storage:
               first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, telegram_message_id INTEGER,
               model TEXT, risk_flags TEXT, seller_name TEXT, seller_since TEXT, deal_status TEXT NOT NULL DEFAULT 'new'
               , profile_id TEXT NOT NULL DEFAULT 'gpu', reject_reason TEXT NOT NULL DEFAULT '',
-              is_mining INTEGER NOT NULL DEFAULT 0
+              is_mining INTEGER NOT NULL DEFAULT 0,
+              missing_cycles INTEGER NOT NULL DEFAULT 0, is_gone INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY AUTOINCREMENT, ad_id TEXT NOT NULL, created_at INTEGER NOT NULL, body TEXT NOT NULL);
@@ -343,6 +344,8 @@ class Storage:
             "profile_id": "TEXT NOT NULL DEFAULT 'gpu'",
             "reject_reason": "TEXT NOT NULL DEFAULT ''",
             "is_mining": "INTEGER NOT NULL DEFAULT 0",
+            "missing_cycles": "INTEGER NOT NULL DEFAULT 0",
+            "is_gone": "INTEGER NOT NULL DEFAULT 0",
         }.items():
             if name not in existing:
                 self.connection.execute(f"ALTER TABLE ads ADD COLUMN {name} {definition}")
@@ -429,12 +432,34 @@ class Storage:
         self.connection.commit()
         return (old, current) if old is not None and current is not None and current < old and row["status"] != "ignored" else None
 
+    def url_has_history(self, search_url: str) -> bool:
+        return self.connection.execute(
+            "SELECT 1 FROM ads WHERE search_url=? LIMIT 1", (search_url,)).fetchone() is not None
+
+    def sweep_missing(self, search_urls: list[str], seen: set[str], limit: int) -> int:
+        """Отмечает снятыми объявления, пропавшие из выдачи на несколько обходов.
+
+        Считаем только по тем ссылкам, которые в этом цикле дочитались до конца:
+        оборванный обход иначе объявил бы снятой половину базы.
+        """
+        if not search_urls or not seen:
+            return 0
+        marks = ",".join("?" * len(search_urls))
+        ids = ",".join("?" * len(seen))
+        params = list(search_urls) + list(seen)
+        self.connection.execute(
+            f"UPDATE ads SET missing_cycles=missing_cycles+1 "
+            f"WHERE search_url IN ({marks}) AND ad_id NOT IN ({ids})", params)
+        self.connection.execute(
+            f"UPDATE ads SET missing_cycles=0, is_gone=0 WHERE ad_id IN ({ids})", list(seen))
+        gone = self.connection.execute(
+            "UPDATE ads SET is_gone=1 WHERE missing_cycles>=? AND is_gone=0", (limit,)).rowcount
+        self.connection.commit()
+        return gone
+
     def get_offset(self) -> int | None:
         row = self.connection.execute("SELECT value FROM meta WHERE key='telegram_offset'").fetchone()
         return int(row["value"]) if row else None
-
-    def baseline_complete(self) -> bool:
-        return self.connection.execute("SELECT 1 FROM meta WHERE key='baseline_completed'").fetchone() is not None
 
     def set_offset(self, offset: int) -> None:
         self.connection.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('telegram_offset',?)", (str(offset),))
@@ -502,7 +527,12 @@ def daily_summary_loop(token: str, chat_id: str, config: dict, stop: threading.E
     try:
         while not stop.wait(20):
             now = datetime.now()
-            if now.strftime("%H:%M") != config.get("daily_summary_time", "21:00"):
+            # Раньше сравнивалась строка «%H:%M» при опросе раз в 20 секунд:
+            # стоило потоку задержаться, минута проскакивала и сводки за день
+            # не было вовсе. Теперь шлём, как только нужное время наступило.
+            target = config.get("daily_summary_time", "21:00")
+            hours, _, minutes = target.partition(":")
+            if (now.hour, now.minute) < (int(hours), int(minutes)):
                 continue
             marker = now.strftime("%Y-%m-%d")
             row = storage.connection.execute("SELECT value FROM meta WHERE key='daily_summary_date'").fetchone()
@@ -863,7 +893,6 @@ def main(debug_count: int | None = None) -> None:
     if not token or not chat_id or "replace_me" in f"{token}{chat_id}":
         raise SystemExit("Заполните TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID в .env.")
     storage = Storage()
-    first_run = not storage.baseline_complete()
     session = olx_session()
     max_pages, page_delay = int(config.get("max_pages_per_search", 0)), float(config.get("page_delay_seconds", 1))
     stop = threading.Event()
@@ -879,10 +908,18 @@ def main(debug_count: int | None = None) -> None:
                 continue
             profiles = config.get("profiles", [{"id": "gpu", "enabled": True}])
             profiles = [p for p in profiles if storage.setting(f"profile_enabled:{p['id']}", "1" if p.get("enabled", True) else "0") == "1"]
+            seen_ids: set[str] = set()
+            complete_urls: list[str] = []
             for profile in profiles:
                 profile_config = {**config, **profile}
                 for search_url in profile_config.get("search_urls", []):
-                    page_number, cycle_ids = 1, set()
+                    # Базовый снимок отдельно на каждую ссылку: добавить новый
+                    # город иначе значило бы разослать всю его выдачу как
+                    # новинки. Ссылка, по которой в базе уже есть объявления,
+                    # считается пройденной — она работала до этой правки.
+                    url_key = f"baseline_done:{search_url}"
+                    url_baseline = not storage.setting(url_key) and not storage.url_has_history(search_url)
+                    page_number, cycle_ids, url_complete = 1, set(), True
                     while max_pages == 0 or page_number <= max_pages:
                         try:
                             response = session.get(page_url(search_url, page_number), timeout=25)
@@ -891,6 +928,9 @@ def main(debug_count: int | None = None) -> None:
                         except NETWORK_ERRORS as error:
                             storage.record_error("Страница выдачи OLX", error)
                             logging.warning("Не удалось прочитать страницу %d: %s", page_number, error)
+                            # 502 после последней страницы — обычный конец рубрики,
+                            # а не сбой: список к этому моменту уже полон.
+                            url_complete = page_number > 1
                             break
                         if not cards or all(card.ad_id in cycle_ids for card in cards):
                             break
@@ -906,7 +946,7 @@ def main(debug_count: int | None = None) -> None:
                                     logging.info("Снижение цены: %s (%s → %s)", brief.ad_id, *decrease)
                                 continue
                             new += 1; page_new += 1
-                            if first_run and not config.get("notify_existing_on_first_run", False):
+                            if url_baseline and not config.get("notify_existing_on_first_run", False):
                                 storage.add_baseline(replace(brief, profile_id=profile_config["id"])); continue
                             try:
                                 listing = assess(fetch_details(session, replace(brief, profile_id=profile_config["id"])), profile_config)
@@ -923,15 +963,17 @@ def main(debug_count: int | None = None) -> None:
                                 logging.exception("Ошибка при обработке %s", brief.ad_id)
                         logging.info("%s · страница %d: карточек %d; новых %d", profile_config.get("name", profile_config["id"]), page_number, len(cards), page_new)
                         page_number += 1; stop.wait(page_delay)
-            # Закрываем baseline только если обход действительно что-то прочитал.
-            # Полностью неудачный первый прогон (например, 403 от OLX) иначе
-            # помечал бы базу построенной вхолостую, и следующий цикл разослал
-            # бы всю выдачу как новинки.
-            if first_run and scanned:
-                storage.connection.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('baseline_completed','1')"); storage.connection.commit(); first_run = False
-            elif first_run:
-                logging.warning("Первый обход не прочитал ни одного объявления; baseline не закрыт, повторю в следующем цикле")
-            logging.info("ИТОГ ПРОГОНА: просмотрено=%d, новых=%d, отправлено=%d, время=%.1f сек.", scanned, new, matched, time.monotonic() - started)
+                    seen_ids |= cycle_ids
+                    if url_complete and cycle_ids:
+                        complete_urls.append(search_url)
+                        if url_baseline:
+                            storage.set_setting(url_key, "1")
+                            logging.info("Базовый снимок построен: %s (%d объявлений)", search_url, len(cycle_ids))
+            gone = storage.sweep_missing(complete_urls, seen_ids, int(config.get("missing_cycles_before_gone", 3)))
+            if gone:
+                logging.info("Помечено снятыми: %d", gone)
+            logging.info("ИТОГ ПРОГОНА: просмотрено=%d, новых=%d, отправлено=%d, снято=%d, время=%.1f сек.",
+                         scanned, new, matched, gone, time.monotonic() - started)
             stop.wait(int(config["poll_interval_seconds"]))
     finally:
         stop.set(); storage.close()

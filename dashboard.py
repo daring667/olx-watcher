@@ -10,6 +10,7 @@ import os
 import sqlite3
 import time
 from html import escape
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 
@@ -43,6 +44,7 @@ details[open].reason summary::after{content:" ▴"}
 .sub a:hover{background:#eef0f6}
 .sub a:first-child{color:#1769e0;font-weight:600}
 .ok{color:#0a7d33;font-weight:600}
+tr.gone{opacity:.5}tr.gone a{text-decoration:line-through}
 @media(prefers-color-scheme:dark){
  body{background:#14161c;color:#e6e8ee}table,.reason,input,select{background:#1d2029;color:#e6e8ee}
  th{background:#242833}td,th,.reason{border-color:#2c3140}nav a.on{color:#e6e8ee}small{color:#98a}
@@ -62,7 +64,9 @@ def connect() -> sqlite3.Connection:
     # тогда без этой проверки все страницы падали бы на отсутствующем столбце.
     existing = {r[1] for r in con.execute("PRAGMA table_info(ads)")}
     for name, definition in (("reject_reason", "TEXT NOT NULL DEFAULT ''"),
-                             ("is_mining", "INTEGER NOT NULL DEFAULT 0")):
+                             ("is_mining", "INTEGER NOT NULL DEFAULT 0"),
+                             ("missing_cycles", "INTEGER NOT NULL DEFAULT 0"),
+                             ("is_gone", "INTEGER NOT NULL DEFAULT 0")):
         if name not in existing:
             con.execute(f"ALTER TABLE ads ADD COLUMN {name} {definition}")
             con.commit()
@@ -70,8 +74,8 @@ def connect() -> sqlite3.Connection:
 
 
 def page(title: str, active: str, body: str) -> str:
-    tabs = {"/": "Отсеянные", "/passed": "Прошли фильтр", "/mining": "⛏ Майнинговые",
-            "/all": "Все объявления"}
+    tabs = {"/": "Отсеянные", "/passed": "Прошли фильтр", "/today": "Новые за сегодня",
+            "/mining": "⛏ Майнинговые", "/all": "Все объявления"}
     nav = "".join(f"<a href='{href}' class='{'on' if href == active else ''}'>{escape(name)}</a>"
                   for href, name in tabs.items())
     return f"<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>" \
@@ -94,36 +98,51 @@ def rows_table(rows: list[sqlite3.Row], notes: dict[str, str], show_reason: bool
                       f"<select name=status>{''.join(f'<option{" selected" if r["status"] == s else ""}>{s}</option>' for s in ('new', 'interested', 'ignored'))}</select>"
                       f"<select name=deal>{''.join(f'<option{" selected" if r["deal_status"] == d else ""}>{d}</option>' for d in ('new', 'позвонить', 'написал', 'договорился', 'купил', 'архив'))}</select>"
                       f"<input name=note placeholder='заметка' value=''><button>Сохранить</button></form>")
+        gone = " class=gone" if r["is_gone"] else ""
         cells.append(
-            f"<tr><td>{escape(r['profile_id'])}</td>"
+            f"<tr{gone}><td>{escape(r['profile_id'])}</td>"
             f"<td><a href='{escape(r['url'], quote=True)}' target=_blank rel=noopener>{escape(r['title'] or '—')}</a>"
             f"{f'<br><small>{escape(note)}</small>' if note else ''}</td>"
             f"<td>{escape(r['model'] or '—')}"
             # Майнинговые видны и в общих списках, а не только на своей вкладке:
             # они проходят фильтр, и скрывать их молча было бы неверно.
             f"{'<br><small>⛏ майнинг</small>' if r['is_mining'] else ''}"
+            f"{'<br><small>🚫 снято с публикации</small>' if r['is_gone'] else ''}"
             f"{'' if r['telegram_message_id'] else '<br><small>не отправлено</small>'}</td>"
             f"<td>{price}<br><a href='/price/{escape(r['ad_id'], quote=True)}' target=_blank><small>история</small></a></td>"
             f"<td>{status}</td><td>{escape(r['seller_name'] or '—')}</td><td>{escape(r['risk_flags'] or '—')}</td></tr>")
     return f"<table>{head}{''.join(cells)}</table>"
 
 
-def listing_page(title: str, active: str, where: str, params: list, show_reason: bool) -> str:
+SORTS = {
+    "price": ("price_kzt IS NULL, price_kzt, first_seen DESC", "по цене"),
+    "new": ("first_seen DESC", "сначала новые"),
+    "seen": ("last_seen DESC", "недавно встречались"),
+}
+
+
+def listing_page(title: str, active: str, where: str, params: list, show_reason: bool,
+                 default_sort: str = "price") -> str:
     query = request.args.get("q", "").strip()
+    sort = request.args.get("sort", default_sort)
+    order = SORTS.get(sort, SORTS[default_sort])[0]
     clauses, values = [where] if where else [], list(params)
     if query:
         clauses.append("(title LIKE ? OR model LIKE ? OR seller_name LIKE ?)")
         values += [f"%{query}%"] * 3
     clause = " WHERE " + " AND ".join(clauses) if clauses else ""
     con = connect()
-    rows = con.execute("SELECT * FROM ads" + clause +
-                       " ORDER BY price_kzt IS NULL, price_kzt, first_seen DESC LIMIT 500", values).fetchall()
+    rows = con.execute(f"SELECT * FROM ads{clause} ORDER BY {order} LIMIT 500", values).fetchall()
     notes = {r["ad_id"]: r["body"] for r in
              con.execute("SELECT ad_id,body FROM notes WHERE id IN (SELECT MAX(id) FROM notes GROUP BY ad_id)")}
     con.close()
     # value экранируется: раньше кавычка в поиске ломала форму и пускала разметку.
+    options = "".join(
+        f"<option value='{key}'{' selected' if key == sort else ''}>{label}</option>"
+        for key, (_, label) in SORTS.items())
     search = (f"<form class=inline><input name=q value='{escape(query, quote=True)}' "
-              f"placeholder='модель, продавец, заголовок…'><button>Искать</button></form>")
+              f"placeholder='модель, продавец, заголовок…'>"
+              f"<select name=sort>{options}</select><button>Показать</button></form>")
     return page(title, active, f"{search}<p>Показано: {len(rows)}</p>{rows_table(rows, notes, show_reason)}")
 
 
@@ -185,6 +204,18 @@ def passed():
     здесь с пометкой «не отправлено» — иначе они пропали бы из виду совсем.
     """
     return listing_page("Прошли фильтр", "/passed", "reject_reason = ''", [], show_reason=False)
+
+
+@app.get("/today")
+def today():
+    """Появившиеся за сегодня — и прошедшие фильтр, и отсеянные.
+
+    Отсеянные тоже показываем: по ним видно, что фильтры съели сегодня, а не
+    вообще за всё время.
+    """
+    midnight = int(datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+    return listing_page("Новые за сегодня", "/today", "first_seen >= ?", [midnight],
+                        show_reason=True, default_sort="new")
 
 
 @app.get("/mining")
