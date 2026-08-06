@@ -201,26 +201,125 @@ mining_keywords:
   - "70hx"
   - "90hx"
 
-# Ориентиры для ПОДПИСИ в уведомлении, на отбор они больше не влияют:
-# отбор идёт по вендору и max_price_kzt. До excellent_max — «выгодно»,
-# до normal_max — «нормальная цена».
+# Ценовые ориентиры. На отбор НЕ влияют (решают вендор и max_price_kzt) —
+# определяют только подпись: до excellent_max «🔥 Выгодно», до normal_max
+# «✅ Нормальная цена», выше «💸 Выше ориентира».
+#
+# Основа — медианы по объявлениям Алматы из собственной базы, сборки ПК
+# отброшены (там цена за весь комплект). «Выгодно» = 80% медианы. Где
+# объявлений меньше пяти, значение выведено из соседних серий: одиночные
+# цены там либо приманка, либо ошибка продавца.
+#
+# Одна запись на серию, без отдельных Ti и Super: медианы и так посчитаны
+# по всей серии сразу, так что ориентир для неё усреднённый.
+#
+# Голый номер в aliases ищется только в заголовке — «тянет 1080p» в описании
+# иначе опознавалось бы как GTX 1080.
 models:
-  - name: "RTX 3060 Ti"
-    aliases: ["rtx 3060 ti", "rtx3060ti", "3060 ti", "3060ti"]
-    excellent_max: 95000
-    normal_max: 115000
-  - name: "RTX 3060"
-    aliases: ["rtx 3060", "rtx3060"]
+  - name: "GTX 960"
+    aliases: ["gtx 960", "gtx960", "960"]
+    excellent_max: 24000
+    normal_max: 30000
+  - name: "GTX 970"
+    aliases: ["gtx 970", "gtx970", "970"]
+    excellent_max: 30000
+    normal_max: 38000
+  - name: "GTX 980"
+    aliases: ["gtx 980", "gtx980", "980"]
+    excellent_max: 28000
+    normal_max: 35000
+  - name: "GTX 1050"
+    aliases: ["gtx 1050", "gtx1050", "1050"]
+    excellent_max: 32000
+    normal_max: 40000
+  - name: "GTX 1060"
+    aliases: ["gtx 1060", "gtx1060", "1060"]
+    excellent_max: 32000
+    normal_max: 40000
+  - name: "GTX 1630"
+    aliases: ["gtx 1630", "gtx1630", "1630"]
+    excellent_max: 36000
+    normal_max: 45000
+  - name: "GTX 1650"
+    aliases: ["gtx 1650", "gtx1650", "1650"]
+    excellent_max: 40000
+    normal_max: 50000
+  - name: "GTX 1070"
+    aliases: ["gtx 1070", "gtx1070", "1070"]
+    excellent_max: 44000
+    normal_max: 55000
+  - name: "GTX 1660"
+    aliases: ["gtx 1660", "gtx1660", "1660"]
+    excellent_max: 56000
+    normal_max: 70000
+  - name: "GTX 1080"
+    aliases: ["gtx 1080", "gtx1080", "1080"]
+    excellent_max: 66000
+    normal_max: 82000
+  - name: "RTX 2060"
+    aliases: ["rtx 2060", "rtx2060", "2060"]
     excellent_max: 80000
-    normal_max: 95000
-  - name: "RTX 3070"
-    aliases: ["rtx 3070", "rtx3070"]
-    excellent_max: 110000
+    normal_max: 100000
+  - name: "RTX 2080"
+    aliases: ["rtx 2080", "rtx2080", "2080"]
+    excellent_max: 96000
+    normal_max: 120000
+  - name: "RTX 2070"
+    aliases: ["rtx 2070", "rtx2070", "2070"]
+    excellent_max: 104000
     normal_max: 130000
+  - name: "RTX 3050"
+    aliases: ["rtx 3050", "rtx3050", "3050"]
+    excellent_max: 84000
+    normal_max: 105000
+  - name: "RTX 3060"
+    aliases: ["rtx 3060", "rtx3060", "3060"]
+    excellent_max: 104000
+    normal_max: 130000
+  - name: "RTX 3070"
+    aliases: ["rtx 3070", "rtx3070", "3070"]
+    excellent_max: 136000
+    normal_max: 170000
+  - name: "RTX 3080"
+    aliases: ["rtx 3080", "rtx3080", "3080"]
+    excellent_max: 168000
+    normal_max: 210000
+  - name: "RTX 3090"
+    aliases: ["rtx 3090", "rtx3090", "3090"]
+    excellent_max: 340000
+    normal_max: 420000
   - name: "RTX 4060"
-    aliases: ["rtx 4060", "rtx4060"]
-    excellent_max: 125000
-    normal_max: 150000
+    aliases: ["rtx 4060", "rtx4060", "4060"]
+    excellent_max: 184000
+    normal_max: 230000
+  - name: "RTX 4070"
+    aliases: ["rtx 4070", "rtx4070", "4070"]
+    excellent_max: 296000
+    normal_max: 370000
+  - name: "RTX 4080"
+    aliases: ["rtx 4080", "rtx4080", "4080"]
+    excellent_max: 385000
+    normal_max: 481000
+  - name: "RTX 4090"
+    aliases: ["rtx 4090", "rtx4090", "4090"]
+    excellent_max: 700000
+    normal_max: 850000
+  - name: "RTX 5060"
+    aliases: ["rtx 5060", "rtx5060", "5060"]
+    excellent_max: 198000
+    normal_max: 247000
+  - name: "RTX 5070"
+    aliases: ["rtx 5070", "rtx5070", "5070"]
+    excellent_max: 400000
+    normal_max: 500000
+  - name: "RTX 5080"
+    aliases: ["rtx 5080", "rtx5080", "5080"]
+    excellent_max: 640000
+    normal_max: 800000
+  - name: "RTX 5090"
+    aliases: ["rtx 5090", "rtx5090", "5090"]
+    excellent_max: 1800000
+    normal_max: 2250000
 
 # Это исключается полностью: не сама дискретная видеокарта.
 hard_excluded_keywords:

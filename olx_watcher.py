@@ -177,11 +177,24 @@ def fetch_details(session: requests.Session, listing: Listing) -> Listing:
     )
 
 
+def alias_matches(alias: str, title: str, content: str) -> bool:
+    """Голый номер модели ищем только в заголовке, остальное — во всём тексте.
+
+    «1080» в описании почти всегда часть «тянет 1080p», и без этого разделения
+    любая карта опознавалась бы как GTX 1080 с чужими ценовыми ориентирами.
+    """
+    alias = alias.casefold().strip()
+    if alias.isdigit():
+        return model_number_in(alias, title.casefold())
+    return alias in content
+
+
 def assess(listing: Listing, config: dict) -> Listing:
     """Определяет модель, выгодность и риски по настраиваемым правилам."""
     content = f"{listing.title} {listing.description}".casefold()
+    title = listing.title or ""
     matched_model = next((model for model in config.get("models", []) if any(
-        alias.casefold() in content for alias in model.get("aliases", [])
+        alias_matches(alias, title, content) for alias in model.get("aliases", [])
     )), None)
     risks = [word for word in config.get("risk_keywords", []) if word.casefold() in content]
     return replace(listing, model=matched_model.get("name") if matched_model else None, risk_flags=", ".join(risks))
@@ -200,10 +213,11 @@ def price_limit(listing: Listing, config: dict) -> int:
 def model_number_in(number: str, title: str) -> bool:
     """Номер модели в заголовке, но не часть разрешения экрана.
 
-    Отбрасывает «1920x1080» и «2560x1080», не задевая «gtx1660»: перед номером
-    запрещена только связка «цифра + x».
+    Отбрасывает «1920x1080» и «1080p», не задевая «gtx1660» и «1050ti»:
+    перед номером запрещена связка «цифра + x», после — цифра или «p».
+    Ни один суффикс NVIDIA с «p» не начинается, а «1080p» встречается часто.
     """
-    return re.search(rf"(?<!\d)(?<!\dx){re.escape(number)}(?!\d)", title) is not None
+    return re.search(rf"(?<!\d)(?<!\dx){re.escape(number)}(?![\dp])", title) is not None
 
 
 def is_mining_card(listing: Listing, config: dict) -> bool:
