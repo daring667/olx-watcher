@@ -156,14 +156,29 @@ def parse_notification(message: Message) -> dict[str, str]:
             "body": body, "link": link}
 
 
+# Слова, по которым письмо опознаётся как уведомление о сообщении, и слова
+# рассылок. Решает ТЕМА: тело ненадёжно — в письме про сохранённый поиск есть
+# фраза «чем оперативнее вы отправите сообщение», и по телу оно бы прошло.
+MESSAGE_SUBJECT = ("ответ", "сообщени", "message", "написал", "отклик")
+NEWSLETTER_SUBJECT = (
+    "критериям", "поиск", "подборк", "рекоменд", "истека", "истёк", "истек",
+    "продлит", "скидк", "акци", "newsletter", "отклонено", "приложение",
+    "статистик", "совет", "промо",
+)
+
+
 def looks_like_message_notification(parsed: dict[str, str]) -> bool:
-    """Отсекает рассылки OLX: акции, советы продавцу, «ваше объявление скоро истечёт»."""
-    haystack = f"{parsed['subject']} {parsed['body'][:400]}".lower()
-    if any(word in haystack for word in ("сообщени", "message", "написал", "ответил")):
-        return not any(word in haystack for word in
-                       ("рассылк", "подборк", "рекоменду", "истека", "истёк", "продлит",
-                        "скидк", "акци", "newsletter"))
-    return False
+    """Уведомление о сообщении, а не рассылка OLX."""
+    subject = parsed["subject"].lower()
+    if any(word in subject for word in NEWSLETTER_SUBJECT):
+        return False
+    if any(word in subject for word in MESSAGE_SUBJECT):
+        return True
+    # Тема неинформативна — тогда уже смотрим начало письма.
+    body = parsed["body"][:400].lower()
+    if any(word in body for word in NEWSLETTER_SUBJECT):
+        return False
+    return any(word in body for word in MESSAGE_SUBJECT)
 
 
 def notify(token: str, chat_id: str, parsed: dict[str, str]) -> None:
