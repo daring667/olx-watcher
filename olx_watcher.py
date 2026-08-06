@@ -196,6 +196,70 @@ def fetch_details(session: requests.Session, listing: Listing) -> Listing:
     )
 
 
+# Кириллица, которой пишут название серии на слух: «ртх 3060», «гтх 1660».
+PHONETIC_MODEL = (
+    ("ртх", "rtx"), ("ртx", "rtx"), ("ртикс", "rtx"),
+    ("гтх", "gtx"), ("гтx", "gtx"), ("гефорс", "geforce"), ("джифорс", "geforce"),
+    ("джефорс", "geforce"), ("нвидиа", "nvidia"), ("нвидия", "nvidia"),
+)
+# Кириллические буквы, неотличимые на вид от латинских: их подставляют
+# случайно при переключённой раскладке — «gtх 1660» с кириллической «х».
+HOMOGLYPHS = str.maketrans("аеорсухтвкмн", "aeopcyxtbkmh")
+
+# Название серии и номер: «rtx 3060», «rtx3060», «RTX-3060», «3060 ti».
+# Обратный порядок («9400 GT») тоже встречается у старых карт.
+MODEL_FORWARD = re.compile(r"\b(rtx|gtx|gts|gt)\s*[-–—]?\s*(\d{3,4})\s*(ti|super)?", re.I)
+MODEL_REVERSE = re.compile(r"\b(\d{3,4})\s*(gts|gt)\b", re.I)
+
+
+def normalize_model_text(text: str) -> str:
+    """Приводит к латинице то, чем пишут модель: раскладка и запись на слух."""
+    low = text.casefold()
+    for cyrillic, latin in PHONETIC_MODEL:
+        low = low.replace(cyrillic, latin)
+    return low.translate(HOMOGLYPHS)
+
+
+def detect_series(title: str, known_numbers: object = ()) -> tuple[str, int] | None:
+    """Серия и номер из заголовка: ('rtx', 3060). Только заголовок — в описании
+    «тянет 1080p» и сравнения с чужими картами дают ложные срабатывания.
+
+    known_numbers — номера моделей NVIDIA из конфига. Нужны для случая, когда
+    названия серии в заголовке нет вовсе: без этого списка «Radeon HD 3650»
+    получал ярлык RTX 3650, потому что номер подходил по форме.
+    """
+    normalized = normalize_model_text(title)
+    match = MODEL_FORWARD.search(normalized)
+    if match:
+        return match.group(1).lower(), int(match.group(2))
+    match = MODEL_REVERSE.search(normalized)
+    if match:
+        return match.group(2).lower(), int(match.group(1))
+    # Голый номер без названия серии: «Видеокарта Palit 1660 ti», «Asus 1070 8gb».
+    # Серия выводится из номера — у NVIDIA 10xx/16xx это GTX, 20xx и выше RTX.
+    for bare in re.finditer(r"(?<!\d)(?<!\dx)(\d{4})(?![\dp])", normalized):
+        number = bare.group(1)
+        if number not in {str(n) for n in known_numbers}:
+            continue
+        return ("gtx" if int(number) < 2000 else "rtx"), int(number)
+    return None
+
+
+def is_outdated_series(series: tuple[str, int] | None) -> bool:
+    """GT и GTS — любые, GTX — только трёхзначные до 900.
+
+    Правило заменяет сотню строк перечисления: GTX 950/960/970/980 остаются
+    (вы просили их сохранить), GTX 4xx-8xx и вся GT уходят, а новые древние
+    находки вроде «9400 GT» отсекаются сами, без правки конфига.
+    """
+    if not series:
+        return False
+    prefix, number = series
+    if prefix in {"gt", "gts"}:
+        return True
+    return prefix == "gtx" and number < 900
+
+
 def alias_matches(alias: str, title: str, content: str) -> bool:
     """Голый номер модели ищем только в заголовке, остальное — во всём тексте.
 
@@ -211,12 +275,12 @@ def alias_matches(alias: str, title: str, content: str) -> bool:
 def assess(listing: Listing, config: dict) -> Listing:
     """Определяет модель, выгодность и риски по настраиваемым правилам."""
     content = f"{listing.title} {listing.description}".casefold()
-    title = listing.title or ""
-    matched_model = next((model for model in config.get("models", []) if any(
-        alias_matches(alias, title, content) for alias in model.get("aliases", [])
-    )), None)
+    # Модель берём правилом по заголовку, а не перебором псевдонимов: правило
+    # само справляется со слитной записью, дефисом, кириллицей и суффиксом Ti.
+    series = detect_series(listing.title or "", config.get("model_number_keywords", ()))
+    model_name = f"{series[0].upper()} {series[1]}" if series else None
     risks = [word for word in config.get("risk_keywords", []) if word.casefold() in content]
-    return replace(listing, model=matched_model.get("name") if matched_model else None, risk_flags=", ".join(risks))
+    return replace(listing, model=model_name, risk_flags=", ".join(risks))
 
 
 def price_limit(listing: Listing, config: dict) -> int:
@@ -271,6 +335,9 @@ def evaluate(listing: Listing, config: dict) -> str:
     # и «вентилятор», и сравнение с Radeon, и упоминание старой GT встречаются
     # сплошь и рядом — по описанию сюда протекала 21 чужая карта и терялось
     # около 60 своих. Товар всегда называет себя в заголовке.
+    series = detect_series(listing.title or "", config.get("model_number_keywords", ()))
+    if is_outdated_series(series):
+        return f"устаревшая серия: {series[0].upper()} {series[1]}"
     for key, label in (("excluded_any_keywords", "комплектующая"),
                        ("outdated_keywords", "устаревшая серия")):
         for word in config.get(key, []):

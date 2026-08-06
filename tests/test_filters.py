@@ -175,6 +175,44 @@ def test_foreign_chat_is_ignored(tmp_path, monkeypatch):
         storage.close()
 
 
+# --- Распознавание серии ----------------------------------------------------
+@pytest.mark.parametrize("title, expected", [
+    ("Видеокарта RTX 3060 12GB", "RTX 3060"),
+    ("PALIT RTX3080 Gaming Pro", "RTX 3080"),          # слитно
+    ("Видеокарта GTX-1050 Ti", "GTX 1050"),            # через дефис
+    ("RTX 3080Ti Gainward 12gb", "RTX 3080"),          # суффикс Ti вплотную
+    ("Видеокарта ртх 3070 8гб", "RTX 3070"),           # кириллицей на слух
+    ("гтх 1660 супер", "GTX 1660"),
+    ("Видеокарта Palit 1660 ti", "GTX 1660"),          # голый номер, серия выведена
+    ("Asus 1070 8gb", "GTX 1070"),
+    ("NVIDIA GeForce 9400 GT", "GT 9400"),             # номер перед серией
+    ("Видеокарта ATI Radeon HD 3650", None),           # чужая карта: номер не наш
+    ("Asus dual rx 7600xt 16gb", None),
+    ("Переходник hdmi-vga", None),
+])
+def test_model_detection(title, expected):
+    assert ad(title).model == expected
+
+
+@pytest.mark.parametrize("title, outdated", [
+    ("NVIDIA GeForce 9400 GT", True),     # правило ловит без правки конфига
+    ("Видеокарта GT 620", True),
+    ("Видеокарта GTX 760", True),
+    ("Видеокарта GTS 450", True),
+    ("ASUS ROG Strix GTX 960", False),    # 9xx оставлены сознательно
+    ("Видеокарта GTX 1050 Ti", False),
+    ("Видеокарта RTX 3060", False),
+])
+def test_outdated_series_rule(title, outdated):
+    reason = evaluate(ad(title, 20000), CONFIG)
+    assert reason.startswith("устаревшая серия") is outdated
+
+
+def test_series_is_read_from_title_not_description():
+    """В описании сравнивают с чужими картами — по нему модель определять нельзя."""
+    assert ad("Видеокарта для игр", 30000, "быстрее чем rtx 3090").model is None
+
+
 # --- Снятые с публикации ----------------------------------------------------
 def storage_with(tmp_path, ads):
     import olx_watcher

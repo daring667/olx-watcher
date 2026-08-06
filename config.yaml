@@ -74,123 +74,27 @@ model_number_keywords:
   - "5080"
   - "5090"
 
-# Серия GT слишком старая. Одного отсутствия «gt» в required_any_keywords мало:
-# такие объявления всё равно проходили по слову «GeForce» в заголовке — так
-# просачивалось 25 карт. Проверяется только заголовок.
+# Серии GT/GTS любого номера и GTX ниже 900 отсекаются ПРАВИЛОМ в коде
+# (is_outdated_series), а не перечислением: раньше здесь лежало больше сотни
+# строк, и всё равно «9400 GT» просочилась мимо списка. GTX 9xx (950/960/970/980)
+# правило оставляет — вы просили их сохранить.
+#
+# Здесь остаются только те древние карты, которые правилом не выражаются:
+# у них номер стоит перед названием серии, а серия — не GT.
 outdated_keywords:
-  - "gt 210"
-  - "gt210"
-  - "gf210"
-  - "g210"
-  - "geforce210"
-  - "geforce 210"
-  - "gt 220"
-  - "gt220"
-  - "gf6200"
-  - "gf 6200"
-  - "8400 gs"
-  - "8600 gt"
-  - "9600 gt"
-  - "9800 gt"
-  - "gt 240"
-  - "gt240"
-  - "gt 315"
-  - "gt 420"
-  - "gt 430"
-  - "gt430"
-  - "gt 440"
-  - "gt 520"
-  - "gt 610"
-  - "gt610"
-  - "gt 620"
-  - "gt620"
-  - "gt 630"
-  - "gt630"
-  - "gt 640"
-  - "gt640"
-  - "gt 710"
-  - "gt710"
-  - "gt 720"
-  - "gt 730"
-  - "gt730"
-  - "gt 740"
-  - "gt 1030"
-  - "gt1030"
-  - "gv-n1030"
-  - "gt 9500"
-  - "9500 gt"
-  - "8400 gs"
-  - "7300 gs"
-  - "gts 250"
-  - "gts 450"
-
-  # Серии GTX 4xx-8xx — ровесники GT, тоже слишком старые.
-  # GTX 9xx (950/960/970/980) сознательно оставлены: ещё тянут игры.
-  # Подстроки безопасны: «gtx 1660» не содержит «gtx 660».
-  - "gtx 450"
-  - "gtx450"
-  - "gtx 460"
-  - "gtx460"
-  - "gtx 470"
-  - "gtx470"
-  - "gtx 480"
-  - "gtx480"
-  - "gtx 490"
-  - "gtx490"
-  - "gtx 550"
-  - "gtx550"
-  - "gtx 560"
-  - "gtx560"
-  - "gtx 570"
-  - "gtx570"
-  - "gtx 580"
-  - "gtx580"
-  - "gtx 590"
-  - "gtx590"
-  - "gtx 650"
-  - "gtx650"
-  - "gtx 660"
-  - "gtx660"
-  - "gtx 670"
-  - "gtx670"
-  - "gtx 680"
-  - "gtx680"
-  - "gtx 690"
-  - "gtx690"
-  - "gtx 750"
-  - "gtx750"
-  - "gtx 760"
-  - "gtx760"
-  - "gtx 770"
-  - "gtx770"
-  - "gtx 780"
-  - "gtx780"
-  - "gtx 790"
-  - "gtx790"
-  - "gtx 850"
-  - "gtx850"
-  - "gtx 860"
-  - "gtx860"
-  - "gtx 870"
-  - "gtx870"
-  - "gtx 880"
-  - "gtx880"
-  - "gtx 890"
-  - "gtx890"
-  # Ещё более ранние серии — старше всего, что уже отключено.
-  - "gtx 260"
-  - "gtx260"
-  - "gtx 275"
-  - "gtx 280"
-  - "gtx280"
-  - "gtx 285"
-  - "gtx 295"
-  - "gtx 360"
-  - "gtx 380"
   - "8800"
+  - "9800 gtx"
   - "9600 gso"
   - "9600gso"
-  - "9800 gtx"
+  - "7300 gs"
+  - "8400 gs"
+  - "gf6200"
+  - "gf 6200"
+  - "gf210"
+  - "g210"
+  - "g 210"
+  - "geforce210"
+  - "geforce 210"
 
 # Майнинговые карты без видеовыходов. Из выборки НЕ исключаются: формально
 # это NVIDIA и цена бывает заманчивой. Помечаются флагом — в панели для них
@@ -220,111 +124,86 @@ mining_keywords:
 # Одна запись на серию, без отдельных Ti и Super: медианы и так посчитаны
 # по всей серии сразу, так что ориентир для неё усреднённый.
 #
-# Голый номер в aliases ищется только в заголовке — «тянет 1080p» в описании
-# иначе опознавалось бы как GTX 1080.
+# Имя серии собирается правилом из заголовка (detect_series), поэтому список
+# псевдонимов больше не нужен: правило само разбирает «RTX3080», «rtx-3080»,
+# «ртх 3080» и «3080 Ti». Здесь достаточно имени и двух порогов.
 models:
   - name: "GTX 960"
-    aliases: ["gtx 960", "gtx960", "960"]
     excellent_max: 24000
     normal_max: 30000
   - name: "GTX 970"
-    aliases: ["gtx 970", "gtx970", "970"]
     excellent_max: 30000
     normal_max: 38000
   - name: "GTX 980"
-    aliases: ["gtx 980", "gtx980", "980"]
     excellent_max: 28000
     normal_max: 35000
   - name: "GTX 1050"
-    aliases: ["gtx 1050", "gtx1050", "1050"]
     excellent_max: 32000
     normal_max: 40000
   - name: "GTX 1060"
-    aliases: ["gtx 1060", "gtx1060", "1060"]
     excellent_max: 32000
     normal_max: 40000
   - name: "GTX 1630"
-    aliases: ["gtx 1630", "gtx1630", "1630"]
     excellent_max: 36000
     normal_max: 45000
   - name: "GTX 1650"
-    aliases: ["gtx 1650", "gtx1650", "1650"]
     excellent_max: 40000
     normal_max: 50000
   - name: "GTX 1070"
-    aliases: ["gtx 1070", "gtx1070", "1070"]
     excellent_max: 44000
     normal_max: 55000
   - name: "GTX 1660"
-    aliases: ["gtx 1660", "gtx1660", "1660"]
     excellent_max: 56000
     normal_max: 70000
   - name: "GTX 1080"
-    aliases: ["gtx 1080", "gtx1080", "1080"]
     excellent_max: 66000
     normal_max: 82000
   - name: "RTX 2060"
-    aliases: ["rtx 2060", "rtx2060", "2060"]
     excellent_max: 80000
     normal_max: 100000
   - name: "RTX 2080"
-    aliases: ["rtx 2080", "rtx2080", "2080"]
     excellent_max: 96000
     normal_max: 120000
   - name: "RTX 2070"
-    aliases: ["rtx 2070", "rtx2070", "2070"]
     excellent_max: 104000
     normal_max: 130000
   - name: "RTX 3050"
-    aliases: ["rtx 3050", "rtx3050", "3050"]
     excellent_max: 84000
     normal_max: 105000
   - name: "RTX 3060"
-    aliases: ["rtx 3060", "rtx3060", "3060"]
     excellent_max: 104000
     normal_max: 130000
   - name: "RTX 3070"
-    aliases: ["rtx 3070", "rtx3070", "3070"]
     excellent_max: 136000
     normal_max: 170000
   - name: "RTX 3080"
-    aliases: ["rtx 3080", "rtx3080", "3080"]
     excellent_max: 168000
     normal_max: 210000
   - name: "RTX 3090"
-    aliases: ["rtx 3090", "rtx3090", "3090"]
     excellent_max: 340000
     normal_max: 420000
   - name: "RTX 4060"
-    aliases: ["rtx 4060", "rtx4060", "4060"]
     excellent_max: 184000
     normal_max: 230000
   - name: "RTX 4070"
-    aliases: ["rtx 4070", "rtx4070", "4070"]
     excellent_max: 296000
     normal_max: 370000
   - name: "RTX 4080"
-    aliases: ["rtx 4080", "rtx4080", "4080"]
     excellent_max: 385000
     normal_max: 481000
   - name: "RTX 4090"
-    aliases: ["rtx 4090", "rtx4090", "4090"]
     excellent_max: 700000
     normal_max: 850000
   - name: "RTX 5060"
-    aliases: ["rtx 5060", "rtx5060", "5060"]
     excellent_max: 198000
     normal_max: 247000
   - name: "RTX 5070"
-    aliases: ["rtx 5070", "rtx5070", "5070"]
     excellent_max: 400000
     normal_max: 500000
   - name: "RTX 5080"
-    aliases: ["rtx 5080", "rtx5080", "5080"]
     excellent_max: 640000
     normal_max: 800000
   - name: "RTX 5090"
-    aliases: ["rtx 5090", "rtx5090", "5090"]
     excellent_max: 1800000
     normal_max: 2250000
 
