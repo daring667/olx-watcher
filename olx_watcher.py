@@ -245,6 +245,19 @@ def detect_series(title: str, known_numbers: object = ()) -> tuple[str, int] | N
     return None
 
 
+# Порядок поколений: GT/GTS древнее любой GTX, GTX древнее любой RTX.
+# Простая сортировка по имени дала бы «GTX 1050» раньше «GTX 960» — строкой
+# «1» меньше «9», хотя карта новее на четыре поколения.
+SERIES_ORDER = {"gt": 0, "gts": 0, "gtx": 1, "rtx": 2}
+
+
+def series_rank(series: tuple[str, int] | None) -> int | None:
+    if not series:
+        return None
+    prefix, number = series
+    return SERIES_ORDER.get(prefix, 0) * 10000 + number
+
+
 def is_outdated_series(series: tuple[str, int] | None) -> bool:
     """GT и GTS — любые, GTX — только трёхзначные до 900.
 
@@ -392,7 +405,8 @@ class Storage:
               model TEXT, risk_flags TEXT, seller_name TEXT, seller_since TEXT, deal_status TEXT NOT NULL DEFAULT 'new'
               , profile_id TEXT NOT NULL DEFAULT 'gpu', reject_reason TEXT NOT NULL DEFAULT '',
               is_mining INTEGER NOT NULL DEFAULT 0,
-              missing_cycles INTEGER NOT NULL DEFAULT 0, is_gone INTEGER NOT NULL DEFAULT 0
+              missing_cycles INTEGER NOT NULL DEFAULT 0, is_gone INTEGER NOT NULL DEFAULT 0,
+              model_rank INTEGER
             );
             CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY AUTOINCREMENT, ad_id TEXT NOT NULL, created_at INTEGER NOT NULL, body TEXT NOT NULL);
@@ -413,6 +427,7 @@ class Storage:
             "is_mining": "INTEGER NOT NULL DEFAULT 0",
             "missing_cycles": "INTEGER NOT NULL DEFAULT 0",
             "is_gone": "INTEGER NOT NULL DEFAULT 0",
+            "model_rank": "INTEGER",
         }.items():
             if name not in existing:
                 self.connection.execute(f"ALTER TABLE ads ADD COLUMN {name} {definition}")
@@ -442,13 +457,14 @@ class Storage:
         )
         self.connection.commit()
 
-    def add_new(self, listing: Listing, reject_reason: str = "", is_mining: bool = False) -> None:
+    def add_new(self, listing: Listing, reject_reason: str = "", is_mining: bool = False,
+                model_rank: int | None = None) -> None:
         now = int(time.time())
         self.connection.execute(
-            "INSERT INTO ads(ad_id,url,title,description,price_kzt,image_url,search_url,status,first_seen,last_seen,model,risk_flags,seller_name,seller_since,profile_id,reject_reason,is_mining) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO ads(ad_id,url,title,description,price_kzt,image_url,search_url,status,first_seen,last_seen,model,risk_flags,seller_name,seller_since,profile_id,reject_reason,is_mining,model_rank) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (listing.ad_id, listing.url, listing.title, listing.description, listing.price_kzt, listing.image_url,
-             listing.search_url, 'new', now, now, listing.model, listing.risk_flags, listing.seller_name, listing.seller_since, listing.profile_id, reject_reason, int(is_mining)),
+             listing.search_url, 'new', now, now, listing.model, listing.risk_flags, listing.seller_name, listing.seller_since, listing.profile_id, reject_reason, int(is_mining), model_rank),
         )
         self.connection.execute("INSERT INTO price_history(ad_id,recorded_at,price_kzt) VALUES(?,?,?)", (listing.ad_id, now, listing.price_kzt))
         self.connection.commit()
@@ -877,9 +893,10 @@ def backfill_reasons(config: dict) -> None:
             # только вместе с ней, и после правки одних лишь ценовых ориентиров
             # (причины те же) модель у всех записей так и оставалась пустой.
             if listing.model and listing.model != row["model"]:
-                storage.connection.execute("UPDATE ads SET model=? WHERE ad_id=?",
-                                           (listing.model, row["ad_id"]))
                 remodelled += 1
+            rank = series_rank(detect_series(row["title"] or "", config.get("model_number_keywords", ())))
+            storage.connection.execute("UPDATE ads SET model=?, model_rank=? WHERE ad_id=?",
+                                       (listing.model, rank, row["ad_id"]))
             # Имя продавца чистим от хвоста «на OLX с … Онлайн в 05:22»:
             # без этого один человек выглядел новым продавцом каждый обход.
             seller = clean_seller_name(row["seller_name"])
@@ -1025,7 +1042,10 @@ def main(debug_count: int | None = None) -> None:
                             try:
                                 listing = assess(fetch_details(session, replace(brief, profile_id=profile_config["id"])), profile_config)
                                 reason = evaluate(listing, profile_config)
-                                storage.add_new(listing, reason, is_mining_card(listing, profile_config))
+                                storage.add_new(
+                                    listing, reason, is_mining_card(listing, profile_config),
+                                    series_rank(detect_series(listing.title or "",
+                                                              profile_config.get("model_number_keywords", ()))))
                                 if not reason:
                                     notify(token, chat_id, listing, storage, profile_config); matched += 1
                             except NETWORK_ERRORS as error:

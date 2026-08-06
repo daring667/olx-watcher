@@ -12,7 +12,7 @@ import time
 from html import escape
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 from flask import Flask, redirect, request
 
@@ -26,6 +26,8 @@ nav{margin:14px 0}nav a{margin-right:14px;color:#1769e0;text-decoration:none}nav
 table{width:100%;border-collapse:collapse;background:#fff;border-radius:8px;overflow:hidden}
 td,th{padding:9px 11px;border-bottom:1px solid #e6e8ee;text-align:left;vertical-align:top}
 th{background:#eef0f6;font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.03em}
+th a.sortable{color:inherit;text-decoration:none;white-space:nowrap;cursor:pointer}
+th a.sortable:hover{color:#1769e0}
 a{color:#1769e0}small{color:#666}
 form.inline{display:flex;gap:5px;flex-wrap:wrap}
 input,select,button{font:inherit;padding:5px 7px;border:1px solid #ccd;border-radius:5px;background:#fff}
@@ -66,7 +68,8 @@ def connect() -> sqlite3.Connection:
     for name, definition in (("reject_reason", "TEXT NOT NULL DEFAULT ''"),
                              ("is_mining", "INTEGER NOT NULL DEFAULT 0"),
                              ("missing_cycles", "INTEGER NOT NULL DEFAULT 0"),
-                             ("is_gone", "INTEGER NOT NULL DEFAULT 0")):
+                             ("is_gone", "INTEGER NOT NULL DEFAULT 0"),
+                             ("model_rank", "INTEGER")):
         if name not in existing:
             con.execute(f"ALTER TABLE ads ADD COLUMN {name} {definition}")
             con.commit()
@@ -82,10 +85,12 @@ def page(title: str, active: str, body: str) -> str:
            f"<title>{escape(title)}</title>{STYLE}<h1>{escape(title)}</h1><nav>{nav}</nav>{body}"
 
 
-def rows_table(rows: list[sqlite3.Row], notes: dict[str, str], show_reason: bool) -> str:
-    head = "<tr><th>Раздел</th><th>Объявление</th><th>Модель</th><th>Цена</th>" \
-           + ("<th>Причина отсева</th>" if show_reason else "<th>Статус</th>") \
-           + "<th>Продавец</th><th>Риски</th></tr>"
+def rows_table(rows: list[sqlite3.Row], notes: dict[str, str], show_reason: bool,
+               sort: str = "price", direction: str = "asc") -> str:
+    order = ["profile", "title", "model", "price", "reason" if show_reason else "status",
+             "seller", "risk"]
+    head = "<tr>" + "".join(
+        sort_link(key, COLUMNS[key][1], sort, direction) for key in order) + "</tr>"
     cells = []
     for r in rows:
         note = notes.get(r["ad_id"], "")
@@ -114,36 +119,65 @@ def rows_table(rows: list[sqlite3.Row], notes: dict[str, str], show_reason: bool
     return f"<table>{head}{''.join(cells)}</table>"
 
 
-SORTS = {
-    "price": ("price_kzt IS NULL, price_kzt, first_seen DESC", "по цене"),
-    "new": ("first_seen DESC", "сначала новые"),
-    "seen": ("last_seen DESC", "недавно встречались"),
+# Колонка -> (выражение для ORDER BY, заголовок). Пустые значения всегда внизу
+# при любом направлении: объявление без цены не должно возглавлять список.
+COLUMNS = {
+    "profile": ("profile_id", "Раздел"),
+    "title": ("title", "Объявление"),
+    # Сортируем по рангу поколения, а не по имени: строкой «GTX 1050» встало бы
+    # раньше «GTX 960», хотя карта новее на четыре поколения.
+    "model": ("model_rank", "Модель"),
+    "price": ("price_kzt", "Цена"),
+    "reason": ("reject_reason", "Причина отсева"),
+    "status": ("status", "Статус"),
+    "seller": ("seller_name", "Продавец"),
+    "risk": ("risk_flags", "Риски"),
+    "new": ("first_seen", "Появилось"),
 }
+
+
+def order_by(sort: str, direction: str) -> str:
+    column = COLUMNS.get(sort, COLUMNS["price"])[0]
+    way = "DESC" if direction == "desc" else "ASC"
+    return f"{column} IS NULL, {column} {way}, first_seen DESC"
+
+
+def sort_link(key: str, label: str, sort: str, direction: str) -> str:
+    """Заголовок-ссылка: первый клик сортирует, повторный разворачивает."""
+    active = key == sort
+    nxt = "desc" if active and direction == "asc" else "asc"
+    params = {k: v for k, v in request.args.items() if k not in ("sort", "dir")}
+    params.update(sort=key, dir=nxt)
+    arrow = (" ▲" if direction == "asc" else " ▼") if active else ""
+    return (f"<th><a class=sortable href='{request.path}?{urlencode(params)}'>"
+            f"{escape(label)}{arrow}</a></th>")
 
 
 def listing_page(title: str, active: str, where: str, params: list, show_reason: bool,
                  default_sort: str = "price") -> str:
     query = request.args.get("q", "").strip()
     sort = request.args.get("sort", default_sort)
-    order = SORTS.get(sort, SORTS[default_sort])[0]
+    direction = request.args.get("dir", "desc" if sort == "new" else "asc")
     clauses, values = [where] if where else [], list(params)
     if query:
         clauses.append("(title LIKE ? OR model LIKE ? OR seller_name LIKE ?)")
         values += [f"%{query}%"] * 3
     clause = " WHERE " + " AND ".join(clauses) if clauses else ""
     con = connect()
-    rows = con.execute(f"SELECT * FROM ads{clause} ORDER BY {order} LIMIT 500", values).fetchall()
+    rows = con.execute(f"SELECT * FROM ads{clause} ORDER BY {order_by(sort, direction)} LIMIT 500",
+                       values).fetchall()
     notes = {r["ad_id"]: r["body"] for r in
              con.execute("SELECT ad_id,body FROM notes WHERE id IN (SELECT MAX(id) FROM notes GROUP BY ad_id)")}
     con.close()
     # value экранируется: раньше кавычка в поиске ломала форму и пускала разметку.
-    options = "".join(
-        f"<option value='{key}'{' selected' if key == sort else ''}>{label}</option>"
-        for key, (_, label) in SORTS.items())
     search = (f"<form class=inline><input name=q value='{escape(query, quote=True)}' "
               f"placeholder='модель, продавец, заголовок…'>"
-              f"<select name=sort>{options}</select><button>Показать</button></form>")
-    return page(title, active, f"{search}<p>Показано: {len(rows)}</p>{rows_table(rows, notes, show_reason)}")
+              f"<input type=hidden name=sort value='{escape(sort, quote=True)}'>"
+              f"<input type=hidden name=dir value='{escape(direction, quote=True)}'>"
+              f"<button>Искать</button></form>")
+    return page(title, active, f"{search}<p>Показано: {len(rows)} · сортировка по столбцу, "
+                               f"повторный клик разворачивает</p>"
+                               f"{rows_table(rows, notes, show_reason, sort, direction)}")
 
 
 def reason_chips(groups: list[sqlite3.Row]) -> str:
