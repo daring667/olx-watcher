@@ -726,7 +726,7 @@ def backfill_reasons(config: dict) -> None:
     try:
         rows = storage.connection.execute("SELECT * FROM ads").fetchall()
         by_profile = {p["id"]: {**config, **p} for p in config.get("profiles", [])}
-        updated = 0
+        updated = remodelled = 0
         for row in rows:
             listing = assess(Listing(
                 row["ad_id"], row["url"], row["title"] or "", row["price_kzt"],
@@ -734,10 +734,16 @@ def backfill_reasons(config: dict) -> None:
             ), by_profile.get(row["profile_id"], config))
             reason = evaluate(listing, by_profile.get(row["profile_id"], config))
             if reason != (row["reject_reason"] or ""):
-                storage.connection.execute(
-                    "UPDATE ads SET reject_reason=?, model=COALESCE(?,model) WHERE ad_id=?",
-                    (reason, listing.model, row["ad_id"]))
+                storage.connection.execute("UPDATE ads SET reject_reason=? WHERE ad_id=?",
+                                           (reason, row["ad_id"]))
                 updated += 1
+            # Модель обновляем отдельно от причины: раньше она переписывалась
+            # только вместе с ней, и после правки одних лишь ценовых ориентиров
+            # (причины те же) модель у всех записей так и оставалась пустой.
+            if listing.model and listing.model != row["model"]:
+                storage.connection.execute("UPDATE ads SET model=? WHERE ad_id=?",
+                                           (listing.model, row["ad_id"]))
+                remodelled += 1
             mining = int(is_mining_card(listing, by_profile.get(row["profile_id"], config)))
             if mining != (row["is_mining"] or 0):
                 storage.connection.execute("UPDATE ads SET is_mining=? WHERE ad_id=?", (mining, row["ad_id"]))
@@ -745,7 +751,8 @@ def backfill_reasons(config: dict) -> None:
         mining_total = storage.connection.execute("SELECT COUNT(*) FROM ads WHERE is_mining=1").fetchone()[0]
         passed = sum(1 for r in storage.connection.execute("SELECT reject_reason FROM ads") if not r["reject_reason"])
         print(f"Майнинговых карт помечено: {mining_total}.")
-        print(f"Пересчитано {len(rows)} объявлений, обновлено {updated}. Проходят фильтр: {passed}.")
+        print(f"Пересчитано {len(rows)} объявлений, причин обновлено {updated}, "
+              f"моделей распознано {remodelled}. Проходят фильтр: {passed}.")
         print("\nПричины отсева:")
         for r in storage.connection.execute(
                 "SELECT reject_reason r, COUNT(*) c FROM ads WHERE reject_reason != '' GROUP BY r ORDER BY c DESC"):
