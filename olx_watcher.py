@@ -142,6 +142,25 @@ def extract_listings(search_url: str, page: str, limit: int) -> list[Listing]:
     return list(found.values())
 
 
+# «Продавец» без имени — заглушка OLX, а не человек с десятками объявлений.
+PLACEHOLDER_SELLERS = {"продавец", "частное лицо", "компания"}
+
+
+def clean_seller_name(raw: str | None) -> str | None:
+    """Только имя, без хвоста «на OLX с … Онлайн в 05:22».
+
+    Селектор захватывает весь блок продавца, а время последнего визита в нём
+    меняется при каждом обходе. Из-за этого одно и то же лицо выглядело новым
+    продавцом каждый раз: 479 «уникальных» на 533 объявления, и предупреждение
+    о перекупе не срабатывало никогда.
+    """
+    if not raw:
+        return None
+    name = re.split(r"\s+(?:на OLX с|На OLX с|Зарегистрирован|Онлайн)\b", raw, maxsplit=1)[0]
+    name = name.strip(" ·,-\u00a0")
+    return None if not name or name.casefold() in PLACEHOLDER_SELLERS else name
+
+
 def fetch_details(session: requests.Session, listing: Listing) -> Listing:
     response = session.get(listing.url, timeout=25)
     response.raise_for_status()
@@ -163,7 +182,7 @@ def fetch_details(session: requests.Session, listing: Listing) -> Listing:
         '[data-testid="ad-price"], [data-cy="ad_price"]'
     )
     seller_node = soup.select_one('[data-cy="seller_name"], [data-testid="seller-name"], a[href*="/user/"]')
-    seller_name = text(seller_node) or None
+    seller_name = clean_seller_name(text(seller_node))
     raw_text = soup.get_text(" ", strip=True)
     since = re.search(r"(?:На OLX с|Зарегистрирован(?:а)?)[\s:]+([^|.]{3,40})", raw_text, re.IGNORECASE)
     return Listing(
@@ -549,7 +568,20 @@ def notify_price_drop(token: str, chat_id: str, listing: Listing, old_price: int
     )
 
 
-def handle_update(token: str, storage: Storage, update: dict) -> None:
+def update_chat_id(update: dict) -> str:
+    callback = update.get("callback_query")
+    message = callback.get("message", {}) if callback else update.get("message", {})
+    return str(message.get("chat", {}).get("id", ""))
+
+
+def handle_update(token: str, storage: Storage, update: dict, allowed_chat_id: str) -> None:
+    # Бот отвечает только владельцу. Без этой проверки любой, кто узнал его
+    # username, мог отправить /favorites и увидеть чужое избранное с заметками
+    # или поставить мониторинг на паузу через /start.
+    sender = update_chat_id(update)
+    if sender and sender != str(allowed_chat_id):
+        logging.warning("Проигнорировано сообщение из чужого чата %s", sender)
+        return
     callback = update.get("callback_query")
     if callback:
         action, _, payload = callback.get("data", "").partition(":")
@@ -663,7 +695,7 @@ def profiles_menu(storage: Storage) -> dict:
     return {"inline_keyboard": buttons}
 
 
-def telegram_listener(token: str, stop: threading.Event) -> None:
+def telegram_listener(token: str, chat_id: str, stop: threading.Event) -> None:
     storage = Storage()
     try:
         while not stop.is_set():
@@ -676,7 +708,7 @@ def telegram_listener(token: str, stop: threading.Event) -> None:
                 response.raise_for_status()
                 for update in response.json().get("result", []):
                     try:
-                        handle_update(token, storage, update)
+                        handle_update(token, storage, update, chat_id)
                     except requests.RequestException as error:
                         # У callback_query есть короткий срок жизни. Старое нажатие
                         # уже нельзя подтвердить, но оно не должно зацикливать очередь.
@@ -726,7 +758,7 @@ def backfill_reasons(config: dict) -> None:
     try:
         rows = storage.connection.execute("SELECT * FROM ads").fetchall()
         by_profile = {p["id"]: {**config, **p} for p in config.get("profiles", [])}
-        updated = remodelled = 0
+        updated = remodelled = sellers_fixed = 0
         for row in rows:
             listing = assess(Listing(
                 row["ad_id"], row["url"], row["title"] or "", row["price_kzt"],
@@ -744,6 +776,13 @@ def backfill_reasons(config: dict) -> None:
                 storage.connection.execute("UPDATE ads SET model=? WHERE ad_id=?",
                                            (listing.model, row["ad_id"]))
                 remodelled += 1
+            # Имя продавца чистим от хвоста «на OLX с … Онлайн в 05:22»:
+            # без этого один человек выглядел новым продавцом каждый обход.
+            seller = clean_seller_name(row["seller_name"])
+            if seller != row["seller_name"]:
+                storage.connection.execute("UPDATE ads SET seller_name=? WHERE ad_id=?",
+                                           (seller, row["ad_id"]))
+                sellers_fixed += 1
             mining = int(is_mining_card(listing, by_profile.get(row["profile_id"], config)))
             if mining != (row["is_mining"] or 0):
                 storage.connection.execute("UPDATE ads SET is_mining=? WHERE ad_id=?", (mining, row["ad_id"]))
@@ -751,6 +790,9 @@ def backfill_reasons(config: dict) -> None:
         mining_total = storage.connection.execute("SELECT COUNT(*) FROM ads WHERE is_mining=1").fetchone()[0]
         passed = sum(1 for r in storage.connection.execute("SELECT reject_reason FROM ads") if not r["reject_reason"])
         print(f"Майнинговых карт помечено: {mining_total}.")
+        unique = storage.connection.execute(
+            "SELECT COUNT(DISTINCT seller_name) FROM ads WHERE seller_name IS NOT NULL").fetchone()[0]
+        print(f"Имён продавцов очищено: {sellers_fixed}, уникальных продавцов: {unique}.")
         print(f"Пересчитано {len(rows)} объявлений, причин обновлено {updated}, "
               f"моделей распознано {remodelled}. Проходят фильтр: {passed}.")
         print("\nПричины отсева:")
@@ -825,7 +867,7 @@ def main(debug_count: int | None = None) -> None:
     session = olx_session()
     max_pages, page_delay = int(config.get("max_pages_per_search", 0)), float(config.get("page_delay_seconds", 1))
     stop = threading.Event()
-    threading.Thread(target=telegram_listener, args=(token, stop), daemon=True, name="telegram-listener").start()
+    threading.Thread(target=telegram_listener, args=(token, chat_id, stop), daemon=True, name="telegram-listener").start()
     threading.Thread(target=daily_summary_loop, args=(token, chat_id, config, stop), daemon=True, name="daily-summary").start()
     logging.info("Помощник запущен: обход раз в %s сек.; команды Telegram: /favorites", config["poll_interval_seconds"])
     try:

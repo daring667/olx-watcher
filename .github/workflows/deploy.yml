@@ -18,38 +18,16 @@ jobs:
 
       - run: pip install -r requirements.txt
 
-      # Юнит-тестов в проекте пока нет. Проверяем то, что реально ломалось:
-      # модули импортируются, конфиг — валидный YAML, а парсер цены не
-      # склеивает номер модели с ценой (та самая ошибка «GT730 6 000 тг»).
       - name: Import and config check
         run: |
           python -c "import olx_watcher, dashboard"
           python -c "import yaml; yaml.safe_load(open('config.example.yaml', encoding='utf-8'))"
 
-      - name: Price parser regression
-        run: |
-          python - <<'EOF'
-          from olx_watcher import extract_price
-          cases = {
-              # Номер модели вплотную к цене — обе формы склейки, которые уже
-              # ломали базу: 3-значный хвост модели и 4-значная модель.
-              "GT730 6 000 тг": 6000,
-              "Видеокарта rx 6800 200 000 тг": 200000,
-              "PULSE RX 6600 150 000 тг": 150000,
-              "Gigabyte 3080 240 000 тг": 240000,
-              "RTX 4070 370 000 тг": 370000,
-              "RTX 3060 90 000 ₸": 90000,
-              "RTX 3060 12Gb 90 000 ₸": 90000,
-              "Видеокарта 2 250 000 ₸": 2250000,
-              "45000 тг": 45000,
-              "Цена договорная": None,
-              "RTX 3080 $600": None,
-          }
-          for text, expected in cases.items():
-              actual = extract_price(text)
-              assert actual == expected, f"{text!r}: получено {actual}, ожидалось {expected}"
-          print(f"{len(cases)} проверок парсера цены пройдено")
-          EOF
+      # Каждый случай в tests/ — реальная ошибка, найденная на боевых данных.
+      # Ломались они молча: неверная цена или потерянная карта видны только по
+      # базе через сутки, а обход при этом отрабатывает без единой жалобы.
+      - name: Run tests
+        run: python -m pytest tests/ -q
 
   deploy:
     needs: test
