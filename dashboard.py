@@ -47,14 +47,18 @@ def connect() -> sqlite3.Connection:
     con.row_factory = sqlite3.Row
     # Колонку заводит бот при старте, но панель может подняться раньше него —
     # тогда без этой проверки все страницы падали бы на отсутствующем столбце.
-    if "reject_reason" not in {r[1] for r in con.execute("PRAGMA table_info(ads)")}:
-        con.execute("ALTER TABLE ads ADD COLUMN reject_reason TEXT NOT NULL DEFAULT ''")
-        con.commit()
+    existing = {r[1] for r in con.execute("PRAGMA table_info(ads)")}
+    for name, definition in (("reject_reason", "TEXT NOT NULL DEFAULT ''"),
+                             ("is_mining", "INTEGER NOT NULL DEFAULT 0")):
+        if name not in existing:
+            con.execute(f"ALTER TABLE ads ADD COLUMN {name} {definition}")
+            con.commit()
     return con
 
 
 def page(title: str, active: str, body: str) -> str:
-    tabs = {"/": "Отсеянные", "/passed": "Прошли фильтр", "/all": "Все объявления"}
+    tabs = {"/": "Отсеянные", "/passed": "Прошли фильтр", "/mining": "⛏ Майнинговые",
+            "/all": "Все объявления"}
     nav = "".join(f"<a href='{href}' class='{'on' if href == active else ''}'>{escape(name)}</a>"
                   for href, name in tabs.items())
     return f"<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>" \
@@ -82,6 +86,9 @@ def rows_table(rows: list[sqlite3.Row], notes: dict[str, str], show_reason: bool
             f"<td><a href='{escape(r['url'], quote=True)}' target=_blank rel=noopener>{escape(r['title'] or '—')}</a>"
             f"{f'<br><small>{escape(note)}</small>' if note else ''}</td>"
             f"<td>{escape(r['model'] or '—')}"
+            # Майнинговые видны и в общих списках, а не только на своей вкладке:
+            # они проходят фильтр, и скрывать их молча было бы неверно.
+            f"{'<br><small>⛏ майнинг</small>' if r['is_mining'] else ''}"
             f"{'' if r['telegram_message_id'] else '<br><small>не отправлено</small>'}</td>"
             f"<td>{price}<br><a href='/price/{escape(r['ad_id'], quote=True)}' target=_blank><small>история</small></a></td>"
             f"<td>{status}</td><td>{escape(r['seller_name'] or '—')}</td><td>{escape(r['risk_flags'] or '—')}</td></tr>")
@@ -134,6 +141,16 @@ def passed():
     здесь с пометкой «не отправлено» — иначе они пропали бы из виду совсем.
     """
     return listing_page("Прошли фильтр", "/passed", "reject_reason = ''", [], show_reason=False)
+
+
+@app.get("/mining")
+def mining():
+    """Карты без видеовыходов: P106/P104, CMP 30HX-90HX.
+
+    Из выборки они не исключены — цена бывает заманчивой, а формально это
+    NVIDIA. Но смотреть их стоит отдельно от игровых.
+    """
+    return listing_page("Майнинговые карты", "/mining", "is_mining = 1", [], show_reason=True)
 
 
 @app.get("/all")

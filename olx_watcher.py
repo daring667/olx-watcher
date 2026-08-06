@@ -206,6 +206,18 @@ def model_number_in(number: str, title: str) -> bool:
     return re.search(rf"(?<!\d)(?<!\dx){re.escape(number)}(?!\d)", title) is not None
 
 
+def is_mining_card(listing: Listing, config: dict) -> bool:
+    """Карта без видеовыходов: P106/P104, CMP 30HX-90HX и подобные.
+
+    Формально это NVIDIA и фильтр она проходит, но для игр непригодна.
+    Не отсеиваем — помечаем, чтобы в панели был отдельный экран.
+    Ищем по заголовку: в описании игровой карты «аналог P106» встречается
+    как сравнение.
+    """
+    title = (listing.title or "").casefold()
+    return any(word.casefold() in title for word in config.get("mining_keywords", []))
+
+
 def evaluate(listing: Listing, config: dict) -> str:
     """Причина отсева или пустая строка, если объявление проходит.
 
@@ -278,7 +290,8 @@ class Storage:
               price_kzt INTEGER, image_url TEXT, search_url TEXT, status TEXT NOT NULL DEFAULT 'new',
               first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, telegram_message_id INTEGER,
               model TEXT, risk_flags TEXT, seller_name TEXT, seller_since TEXT, deal_status TEXT NOT NULL DEFAULT 'new'
-              , profile_id TEXT NOT NULL DEFAULT 'gpu', reject_reason TEXT NOT NULL DEFAULT ''
+              , profile_id TEXT NOT NULL DEFAULT 'gpu', reject_reason TEXT NOT NULL DEFAULT '',
+              is_mining INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY AUTOINCREMENT, ad_id TEXT NOT NULL, created_at INTEGER NOT NULL, body TEXT NOT NULL);
@@ -296,6 +309,7 @@ class Storage:
             "deal_status": "TEXT NOT NULL DEFAULT 'new'",
             "profile_id": "TEXT NOT NULL DEFAULT 'gpu'",
             "reject_reason": "TEXT NOT NULL DEFAULT ''",
+            "is_mining": "INTEGER NOT NULL DEFAULT 0",
         }.items():
             if name not in existing:
                 self.connection.execute(f"ALTER TABLE ads ADD COLUMN {name} {definition}")
@@ -325,13 +339,13 @@ class Storage:
         )
         self.connection.commit()
 
-    def add_new(self, listing: Listing, reject_reason: str = "") -> None:
+    def add_new(self, listing: Listing, reject_reason: str = "", is_mining: bool = False) -> None:
         now = int(time.time())
         self.connection.execute(
-            "INSERT INTO ads(ad_id,url,title,description,price_kzt,image_url,search_url,status,first_seen,last_seen,model,risk_flags,seller_name,seller_since,profile_id,reject_reason) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO ads(ad_id,url,title,description,price_kzt,image_url,search_url,status,first_seen,last_seen,model,risk_flags,seller_name,seller_since,profile_id,reject_reason,is_mining) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (listing.ad_id, listing.url, listing.title, listing.description, listing.price_kzt, listing.image_url,
-             listing.search_url, 'new', now, now, listing.model, listing.risk_flags, listing.seller_name, listing.seller_since, listing.profile_id, reject_reason),
+             listing.search_url, 'new', now, now, listing.model, listing.risk_flags, listing.seller_name, listing.seller_since, listing.profile_id, reject_reason, int(is_mining)),
         )
         self.connection.execute("INSERT INTO price_history(ad_id,recorded_at,price_kzt) VALUES(?,?,?)", (listing.ad_id, now, listing.price_kzt))
         self.connection.commit()
@@ -476,6 +490,8 @@ def listing_caption(listing: Listing, config: dict, storage: Storage) -> str:
     extras = [item for item in [f"Модель: <b>{html.escape(listing.model)}</b>" if listing.model else "", price_label(listing, config)] if item]
     if listing.risk_flags:
         extras.append(f"⚠️ Риски в описании: {html.escape(listing.risk_flags)}")
+    if is_mining_card(listing, config):
+        extras.append("⛏ Майнинговая карта: видеовыходов нет, для игр непригодна")
     if listing.seller_name:
         count = storage.seller_count(listing.seller_name)
         seller = f"Продавец: {html.escape(listing.seller_name)}"
@@ -708,8 +724,13 @@ def backfill_reasons(config: dict) -> None:
                     "UPDATE ads SET reject_reason=?, model=COALESCE(?,model) WHERE ad_id=?",
                     (reason, listing.model, row["ad_id"]))
                 updated += 1
+            mining = int(is_mining_card(listing, by_profile.get(row["profile_id"], config)))
+            if mining != (row["is_mining"] or 0):
+                storage.connection.execute("UPDATE ads SET is_mining=? WHERE ad_id=?", (mining, row["ad_id"]))
         storage.connection.commit()
+        mining_total = storage.connection.execute("SELECT COUNT(*) FROM ads WHERE is_mining=1").fetchone()[0]
         passed = sum(1 for r in storage.connection.execute("SELECT reject_reason FROM ads") if not r["reject_reason"])
+        print(f"Майнинговых карт помечено: {mining_total}.")
         print(f"Пересчитано {len(rows)} объявлений, обновлено {updated}. Проходят фильтр: {passed}.")
         print("\nПричины отсева:")
         for r in storage.connection.execute(
@@ -784,7 +805,7 @@ def main(debug_count: int | None = None) -> None:
                             try:
                                 listing = assess(fetch_details(session, replace(brief, profile_id=profile_config["id"])), profile_config)
                                 reason = evaluate(listing, profile_config)
-                                storage.add_new(listing, reason)
+                                storage.add_new(listing, reason, is_mining_card(listing, profile_config))
                                 if not reason:
                                     notify(token, chat_id, listing, storage, profile_config); matched += 1
                             except NETWORK_ERRORS as error:
