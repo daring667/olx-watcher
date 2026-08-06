@@ -11,6 +11,7 @@ import sqlite3
 import time
 from html import escape
 from pathlib import Path
+from urllib.parse import quote
 
 from flask import Flask, redirect, request
 
@@ -28,13 +29,25 @@ a{color:#1769e0}small{color:#666}
 form.inline{display:flex;gap:5px;flex-wrap:wrap}
 input,select,button{font:inherit;padding:5px 7px;border:1px solid #ccd;border-radius:5px;background:#fff}
 button{cursor:pointer;background:#1769e0;color:#fff;border-color:#1769e0}
-.reasons{display:flex;gap:9px;flex-wrap:wrap;margin:12px 0}
+.reasons{display:flex;gap:9px;flex-wrap:wrap;margin:12px 0;align-items:flex-start}
 .reason{background:#fff;border:1px solid #e6e8ee;border-radius:8px;padding:9px 13px;text-decoration:none;color:#1a1d24}
 .reason b{display:block;font-size:20px}
+details.reason{padding:0;overflow:hidden}
+details.reason summary{padding:9px 13px;cursor:pointer;list-style:none;user-select:none}
+details.reason summary::-webkit-details-marker{display:none}
+details.reason summary::after{content:" ▾";color:#888}
+details[open].reason summary::after{content:" ▴"}
+.hint{color:#888;font-size:12px}
+.sub{display:flex;flex-direction:column;border-top:1px solid #e6e8ee;max-height:280px;overflow-y:auto}
+.sub a{padding:6px 13px;text-decoration:none;color:#1a1d24;display:flex;justify-content:space-between;gap:16px;font-size:13px}
+.sub a:hover{background:#eef0f6}
+.sub a:first-child{color:#1769e0;font-weight:600}
 .ok{color:#0a7d33;font-weight:600}
 @media(prefers-color-scheme:dark){
  body{background:#14161c;color:#e6e8ee}table,.reason,input,select{background:#1d2029;color:#e6e8ee}
  th{background:#242833}td,th,.reason{border-color:#2c3140}nav a.on{color:#e6e8ee}small{color:#98a}
+ .sub{border-color:#2c3140}.sub a{color:#e6e8ee}.sub a:hover{background:#242833}
+ .sub a:first-child{color:#6ea8fe}
 }
 </style>"""
 
@@ -114,22 +127,53 @@ def listing_page(title: str, active: str, where: str, params: list, show_reason:
     return page(title, active, f"{search}<p>Показано: {len(rows)}</p>{rows_table(rows, notes, show_reason)}")
 
 
+def reason_chips(groups: list[sqlite3.Row]) -> str:
+    """Причины отсева, свёрнутые по категориям.
+
+    Одних «устаревшая серия: …» набирается больше двадцати штук, и плоский
+    список чипов невозможно читать. Категория — часть причины до двоеточия;
+    внутри раскрывашка со списком конкретных серий и количеством.
+    """
+    categories: dict[str, list[tuple[str, int]]] = {}
+    for row in groups:
+        category = row["r"].split(":", 1)[0] if ":" in row["r"] else row["r"]
+        categories.setdefault(category, []).append((row["r"], row["c"]))
+
+    chips = [f"<a class=reason href='/'><b>{sum(g['c'] for g in groups)}</b>все причины</a>"]
+    for category, items in sorted(categories.items(), key=lambda kv: -sum(c for _, c in kv[1])):
+        total = sum(count for _, count in items)
+        if len(items) == 1 and items[0][0] == category:
+            chips.append(f"<a class=reason href='/?reason={quote(category)}'>"
+                         f"<b>{total}</b>{escape(category)}</a>")
+            continue
+        inner = "".join(
+            f"<a href='/?reason={quote(reason)}'>"
+            f"{escape(reason.split(': ', 1)[-1])} <b>{count}</b></a>"
+            for reason, count in items)
+        chips.append(
+            f"<details class=reason><summary><b>{total}</b>{escape(category)}"
+            f"<span class=hint> · {len(items)}</span></summary>"
+            f"<div class=sub><a href='/?group={quote(category)}'>показать все {total}</a>{inner}</div>"
+            f"</details>")
+    return f"<div class=reasons>{''.join(chips)}</div>"
+
+
 @app.get("/")
 def rejected():
     """Что фильтры съели и почему — сгруппировано по причине."""
-    reason = request.args.get("reason", "")
+    reason, group = request.args.get("reason", ""), request.args.get("group", "")
     con = connect()
-    groups = con.execute(
-        "SELECT reject_reason r, COUNT(*) c FROM ads WHERE reject_reason != '' GROUP BY r ORDER BY c DESC").fetchall()
+    groups = con.execute("SELECT reject_reason r, COUNT(*) c FROM ads WHERE reject_reason != '' "
+                         "GROUP BY r ORDER BY c DESC").fetchall()
     con.close()
-    chips = "".join(
-        f"<a class=reason href='/?reason={escape(g['r'], quote=True)}'><b>{g['c']}</b>{escape(g['r'])}</a>"
-        for g in groups)
-    total = sum(g["c"] for g in groups)
-    header = f"<div class=reasons><a class=reason href='/'><b>{total}</b>все причины</a>{chips}</div>"
-    where, params = ("reject_reason = ?", [reason]) if reason else ("reject_reason != ''", [])
+    if reason:
+        where, params = "reject_reason = ?", [reason]
+    elif group:
+        where, params = "reject_reason LIKE ?", [f"{group}:%"]
+    else:
+        where, params = "reject_reason != ''", []
     body = listing_page("Отсеянные объявления", "/", where, params, show_reason=True)
-    return body.replace("<p>Показано:", header + "<p>Показано:", 1)
+    return body.replace("<p>Показано:", reason_chips(groups) + "<p>Показано:", 1)
 
 
 @app.get("/passed")
