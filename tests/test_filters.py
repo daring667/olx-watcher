@@ -186,12 +186,42 @@ def test_foreign_chat_is_ignored(tmp_path, monkeypatch):
     ("Видеокарта Palit 1660 ti", "GTX 1660"),          # голый номер, серия выведена
     ("Asus 1070 8gb", "GTX 1070"),
     ("NVIDIA GeForce 9400 GT", "GT 9400"),             # номер перед серией
-    ("Видеокарта ATI Radeon HD 3650", None),           # чужая карта: номер не наш
-    ("Asus dual rx 7600xt 16gb", None),
     ("Переходник hdmi-vga", None),
+    # Чужие вендоры тоже опознаются — ради столбца «Модель» в панели.
+    ("Видеокарта Sapphire RX 580 8GB", "RX 580"),
+    ("Asus dual rx 7600xt 16gb", "RX 7600"),
+    ("Видеокарта ATI Radeon HD 3650", "Radeon HD 3650"),
+    ("Sapphire NITRO Radeon R9 380 4GB", "R9 380"),
+    ("Radeon Vega 56 8GB", "Vega 56"),
+    ("Intel Arc A770 16Gb", "Arc A770"),               # буква поколения слитно
+    ("Intel ARC B580 12Gb", "Arc B580"),
 ])
 def test_model_detection(title, expected):
     assert ad(title).model == expected
+
+
+@pytest.mark.parametrize("title", [
+    "Видеокарта Sapphire RX 580 8GB",
+    "Видеокарта ATI Radeon HD 3650",
+    "Radeon Vega 56 8GB",
+    "Intel Arc A770 16Gb",
+])
+def test_foreign_models_are_still_rejected(title):
+    """Опознание модели AMD и Intel не должно пускать их в выборку.
+
+    Ворота «нет ключевого слова» пропускают объявление с распознанной моделью,
+    поэтому проверяются именно серии NVIDIA — иначе Radeon держалась бы только
+    на отсеве по чужому вендору, а карта без слова «radeon» в заголовке
+    проскочила бы насквозь.
+    """
+    assert evaluate(ad(title, 30000), CONFIG).startswith("другой вендор")
+
+
+def test_amd_without_vendor_word_in_title_is_rejected():
+    """«HD 5450» без слова radeon: модель опознана, но в выборку не идёт."""
+    listing = ad("Видеокарта HD 5450 1GB", 5000)
+    assert listing.model == "Radeon HD 5450"
+    assert evaluate(listing, CONFIG) == "нет ключевого слова"
 
 
 @pytest.mark.parametrize("title, outdated", [

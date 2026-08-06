@@ -208,8 +208,18 @@ HOMOGLYPHS = str.maketrans("аеорсухтвкмн", "aeopcyxtbkmh")
 
 # Название серии и номер: «rtx 3060», «rtx3060», «RTX-3060», «3060 ti».
 # Обратный порядок («9400 GT») тоже встречается у старых карт.
-MODEL_FORWARD = re.compile(r"\b(rtx|gtx|gts|gt)\s*[-–—]?\s*(\d{3,4})\s*(ti|super)?", re.I)
+MODEL_FORWARD = re.compile(
+    r"\b(rtx|gtx|gts|gt|rx|r9|r7|r5|hd|arc\s*[ab]|arc)\s*[-–—]?\s*(\d{2,4})\s*(ti|xt|xtx|super)?", re.I)
 MODEL_REVERSE = re.compile(r"\b(\d{3,4})\s*(gts|gt)\b", re.I)
+# Vega нумеруется без префикса серии: «Vega 56», «Vega 64».
+MODEL_VEGA = re.compile(r"\bvega\s*(\d{2})\b", re.I)
+
+# Как показывать серию в столбце «Модель».
+SERIES_LABEL = {"gt": "GT", "gts": "GTS", "gtx": "GTX", "rtx": "RTX",
+                "rx": "RX", "r9": "R9", "r7": "R7", "r5": "R5",
+                "hd": "Radeon HD", "vega": "Vega",
+                "arc": "Arc", "arca": "Arc A", "arcb": "Arc B"}
+NVIDIA_SERIES = {"gt", "gts", "gtx", "rtx"}
 
 
 def normalize_model_text(text: str) -> str:
@@ -218,6 +228,20 @@ def normalize_model_text(text: str) -> str:
     for cyrillic, latin in PHONETIC_MODEL:
         low = low.replace(cyrillic, latin)
     return low.translate(HOMOGLYPHS)
+
+
+def is_nvidia_series(series: tuple[str, int] | None) -> bool:
+    return bool(series) and series[0] in NVIDIA_SERIES
+
+
+def series_label(series: tuple[str, int] | None) -> str | None:
+    if not series:
+        return None
+    prefix, number = series
+    # У Intel буква поколения пишется слитно с номером: «Arc A770», не «Arc A 770».
+    if prefix in {"arca", "arcb"}:
+        return f"Arc {prefix[3].upper()}{number}"
+    return f"{SERIES_LABEL.get(prefix, prefix.upper())} {number}"
 
 
 def detect_series(title: str, known_numbers: object = ()) -> tuple[str, int] | None:
@@ -231,7 +255,15 @@ def detect_series(title: str, known_numbers: object = ()) -> tuple[str, int] | N
     normalized = normalize_model_text(title)
     match = MODEL_FORWARD.search(normalized)
     if match:
-        return match.group(1).lower(), int(match.group(2))
+        prefix = re.sub(r"\s+", "", match.group(1).lower())
+        # «Arc A770» и «Arc B580»: буква поколения в префиксе, номер отдельно.
+        # У Intel буква поколения — часть названия: «Arc A770», «Arc B580».
+        if prefix.startswith("arc"):
+            prefix = "arc" + prefix[3:4] if len(prefix) > 3 else "arc"
+        return prefix, int(match.group(2))
+    match = MODEL_VEGA.search(normalized)
+    if match:
+        return "vega", int(match.group(1))
     match = MODEL_REVERSE.search(normalized)
     if match:
         return match.group(2).lower(), int(match.group(1))
@@ -248,7 +280,10 @@ def detect_series(title: str, known_numbers: object = ()) -> tuple[str, int] | N
 # Порядок поколений: GT/GTS древнее любой GTX, GTX древнее любой RTX.
 # Простая сортировка по имени дала бы «GTX 1050» раньше «GTX 960» — строкой
 # «1» меньше «9», хотя карта новее на четыре поколения.
-SERIES_ORDER = {"gt": 0, "gts": 0, "gtx": 1, "rtx": 2}
+# Сначала NVIDIA по поколениям, затем AMD, затем Intel — внутри по номеру.
+SERIES_ORDER = {"gt": 0, "gts": 0, "gtx": 1, "rtx": 2,
+                "hd": 3, "r5": 4, "r7": 4, "r9": 4, "rx": 5, "vega": 6,
+                "arc": 7, "arca": 7, "arcb": 8}
 
 
 def series_rank(series: tuple[str, int] | None) -> int | None:
@@ -291,7 +326,7 @@ def assess(listing: Listing, config: dict) -> Listing:
     # Модель берём правилом по заголовку, а не перебором псевдонимов: правило
     # само справляется со слитной записью, дефисом, кириллицей и суффиксом Ti.
     series = detect_series(listing.title or "", config.get("model_number_keywords", ()))
-    model_name = f"{series[0].upper()} {series[1]}" if series else None
+    model_name = series_label(series)
     risks = [word for word in config.get("risk_keywords", []) if word.casefold() in content]
     return replace(listing, model=model_name, risk_flags=", ".join(risks))
 
@@ -350,7 +385,7 @@ def evaluate(listing: Listing, config: dict) -> str:
     # около 60 своих. Товар всегда называет себя в заголовке.
     series = detect_series(listing.title or "", config.get("model_number_keywords", ()))
     if is_outdated_series(series):
-        return f"устаревшая серия: {series[0].upper()} {series[1]}"
+        return f"устаревшая серия: {series_label(series)}"
     for key, label in (("excluded_any_keywords", "комплектующая"),
                        ("outdated_keywords", "устаревшая серия")):
         for word in config.get(key, []):
@@ -368,7 +403,7 @@ def evaluate(listing: Listing, config: dict) -> str:
     # «тянет 1080p» есть почти везде.
     if (not any(word.casefold() in content for word in config["required_any_keywords"])
             and not any(model_number_in(str(number), title) for number in config.get("model_number_keywords", []))
-            and not listing.model):
+            and not is_nvidia_series(series)):
         return "нет ключевого слова"
     if listing.price_kzt is None:
         return "цена не распознана"
