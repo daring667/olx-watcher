@@ -238,6 +238,25 @@ def test_empty_cycle_marks_nothing(tmp_path):
         storage.close()
 
 
+def test_reobserving_moves_ad_to_current_search_url(tmp_path):
+    """Смена ссылки поиска не должна выкидывать старые объявления из подметания.
+
+    Они записаны с прежним search_url, а подметание считает только по ссылкам,
+    пройденным в этом цикле — без переноса они никогда не пометились бы снятыми.
+    """
+    storage = storage_with(tmp_path, [("A", "старая-ссылка")])
+    try:
+        storage.observe_price(Listing("A", "https://olx.kz/a", "Карта", 30000,
+                                      search_url="новая-ссылка"))
+        assert storage.url_has_history("новая-ссылка") is True
+        for _ in range(3):
+            storage.sweep_missing(["новая-ссылка"], {"B"}, limit=3)
+        row = storage.connection.execute("SELECT is_gone FROM ads WHERE ad_id='A'").fetchone()
+        assert row["is_gone"] == 1
+    finally:
+        storage.close()
+
+
 def test_url_has_history(tmp_path):
     """Новая ссылка не должна считаться пройденной — иначе город разошлётся весь."""
     storage = storage_with(tmp_path, [("A", "url1")])

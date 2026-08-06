@@ -425,7 +425,14 @@ class Storage:
         if not row:
             return None
         old, current = row["price_kzt"], listing.price_kzt
-        self.connection.execute("UPDATE ads SET last_seen=?, title=COALESCE(?,title), url=COALESCE(NULLIF(?,''),url) WHERE ad_id=?", (int(time.time()), listing.title, listing.url, listing.ad_id))
+        # search_url переписываем на текущий: иначе объявления, добавленные при
+        # прежней ссылке (без радиуса), навсегда выпали бы из подметания снятых —
+        # оно считает только по ссылкам, пройденным в этом цикле.
+        self.connection.execute(
+            "UPDATE ads SET last_seen=?, title=COALESCE(NULLIF(?,''),title), "
+            "url=COALESCE(NULLIF(?,''),url), search_url=COALESCE(NULLIF(?,''),search_url) "
+            "WHERE ad_id=?",
+            (int(time.time()), listing.title, listing.url, listing.search_url, listing.ad_id))
         if current is not None and current != old:
             self.connection.execute("UPDATE ads SET price_kzt=? WHERE ad_id=?", (current, listing.ad_id))
             self.connection.execute("INSERT INTO price_history(ad_id,recorded_at,price_kzt) VALUES(?,?,?)", (listing.ad_id, int(time.time()), current))
