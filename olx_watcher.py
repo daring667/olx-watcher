@@ -761,6 +761,49 @@ def backfill_reasons(config: dict) -> None:
         storage.close()
 
 
+def send_best(config: dict, dry_run: bool = True) -> None:
+    """Разовая рассылка объявлений с меткой «🔥 Выгодно», ещё не ушедших в чат.
+
+    Нужна после смены правил: объявления, просмотренные при старых фильтрах,
+    в Telegram не попадали, а повторно бот их не разбирает — они уже в базе.
+    По умолчанию только показывает список; отправляет с --send.
+    """
+    load_dotenv(ROOT / ".env")
+    token, chat_id = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
+    if not dry_run and (not token or not chat_id):
+        raise SystemExit("Заполните TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID в .env.")
+    excellent = {m["name"]: int(m["excellent_max"]) for m in config.get("models", [])}
+    storage = Storage()
+    try:
+        rows = storage.connection.execute(
+            "SELECT * FROM ads WHERE reject_reason='' AND telegram_message_id IS NULL "
+            "AND price_kzt IS NOT NULL AND model IS NOT NULL ORDER BY price_kzt").fetchall()
+        best = [r for r in rows if r["price_kzt"] <= excellent.get(r["model"], 0)]
+        print(f"Выгодных и не отправленных: {len(best)}")
+        for row in best:
+            listing = Listing(
+                row["ad_id"], row["url"], row["title"] or "", row["price_kzt"],
+                row["description"] or "", row["image_url"], row["search_url"],
+                row["model"], row["risk_flags"] or "", row["seller_name"],
+                row["seller_since"], row["profile_id"],
+            )
+            mark = " ⛏" if row["is_mining"] else ""
+            print(f"  {row['price_kzt']:>7} ₸ | {row['model']:9}{mark} | {listing.title[:44]}")
+            if dry_run:
+                continue
+            try:
+                notify(token, chat_id, listing, storage, config)
+                # Telegram ограничивает частоту в один чат; пауза бережёт от 429.
+                time.sleep(2)
+            except requests.RequestException as error:
+                storage.record_error("Разовая рассылка", error, listing)
+                logging.warning("Не отправлено %s: %s", listing.ad_id, safe_error(error))
+        print("\nЭто предпросмотр. Для отправки добавьте --send." if dry_run
+              else f"\nОтправлено: {len(best)}.")
+    finally:
+        storage.close()
+
+
 def print_favorites() -> None:
     storage = Storage()
     try:
@@ -857,6 +900,8 @@ if __name__ == "__main__":
     parser.add_argument("--debug", type=int, metavar="N", help="один раз проверить N карточек без сохранения")
     parser.add_argument("--favorites", action="store_true", help="вывести избранное в терминал, от дешёвых к дорогим")
     parser.add_argument("--backfill-reasons", action="store_true", help="пересчитать причины отсева для уже сохранённых объявлений")
+    parser.add_argument("--send-best", action="store_true", help="показать выгодные объявления, ещё не ушедшие в Telegram")
+    parser.add_argument("--send", action="store_true", help="вместе с --send-best: действительно отправить")
     args = parser.parse_args()
     ROOT.joinpath("data").mkdir(exist_ok=True)
     formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
@@ -869,6 +914,8 @@ if __name__ == "__main__":
             print_favorites()
         elif args.backfill_reasons:
             backfill_reasons(load_config())
+        elif args.send_best:
+            send_best(load_config(), dry_run=not args.send)
         else:
             main(args.debug)
     except KeyboardInterrupt:
