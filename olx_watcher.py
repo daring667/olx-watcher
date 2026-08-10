@@ -848,6 +848,42 @@ def handle_remind(token: str, storage: Storage, message: dict) -> None:
                      text=f"⏰ Напоминание установлено на {when}\n{html.escape(title[:80])}", parse_mode="HTML")
 
 
+# Список для меню команд Telegram: по нажатию «/» клиент показывает его
+# подсказкой. Имена только латиницей в нижнем регистре — таково требование
+# API, поэтому синоним «/избранное» сюда не попадает, хотя и работает.
+BOT_COMMANDS = [
+    {"command": "menu", "description": "Панель управления"},
+    {"command": "favorites", "description": "Избранное — от дешёвых к дорогим"},
+    {"command": "search", "description": "Поиск по базе: /search rtx 3060"},
+    {"command": "setprice", "description": "Потолок цены: /setprice 80000"},
+    {"command": "remind", "description": "Напомнить об объявлении: /remind ID… 2d"},
+    {"command": "help", "description": "Что умеет бот"},
+]
+
+HELP_TEXT = (
+    "<b>Команды</b>\n"
+    "/search &lt;запрос&gt; — поиск по заголовку, модели и продавцу\n"
+    "/setprice &lt;сумма&gt; — потолок цены; <code>reset</code> вернёт значение из конфига\n"
+    "/remind &lt;ID или ссылка&gt; &lt;срок&gt; — напоминание, срок вида 30m, 2h, 1d\n"
+    "/favorites — избранное от дешёвых к дорогим\n"
+    "/menu — кнопки: пауза, профили, сводка, избранное"
+)
+
+
+def register_commands(token: str) -> None:
+    """Регистрирует меню команд, чтобы Telegram подсказывал их по «/».
+
+    Сбой здесь не должен мешать обходу: подсказки — удобство, а не условие
+    работы, поэтому ошибка только пишется в лог.
+    """
+    try:
+        telegram_request(token, "setMyCommands",
+                         commands=json.dumps(BOT_COMMANDS, ensure_ascii=False))
+        logging.info("Меню команд Telegram обновлено: %d штук", len(BOT_COMMANDS))
+    except requests.RequestException as error:
+        logging.warning("Не удалось обновить меню команд: %s", safe_error(error))
+
+
 def update_chat_id(update: dict) -> str:
     callback = update.get("callback_query")
     message = callback.get("message", {}) if callback else update.get("message", {})
@@ -949,8 +985,11 @@ def handle_update(token: str, storage: Storage, update: dict, allowed_chat_id: s
     command = message_text.split("@", 1)[0].lower()
     if command in {"/favorites", "/избранное"}:
         telegram_request(token, "sendMessage", chat_id=message["chat"]["id"], text=favorite_text(storage), parse_mode="HTML", disable_web_page_preview=True)
-    elif command in {"/start", "/help", "/menu"}:
+    elif command in {"/start", "/menu"}:
         telegram_request(token, "sendMessage", chat_id=message["chat"]["id"], text="Панель управления помощником", reply_markup=json.dumps(main_menu(storage), ensure_ascii=False))
+    elif command == "/help":
+        telegram_request(token, "sendMessage", chat_id=message["chat"]["id"], text=HELP_TEXT,
+                         parse_mode="HTML", reply_markup=json.dumps(main_menu(storage), ensure_ascii=False))
     elif message_text.lower().startswith("/search"):
         handle_search(token, storage, message)
     elif message_text.lower().startswith("/setprice"):
@@ -1156,7 +1195,8 @@ def main(debug_count: int | None = None) -> None:
     stop = threading.Event()
     threading.Thread(target=telegram_listener, args=(token, chat_id, stop), daemon=True, name="telegram-listener").start()
     threading.Thread(target=daily_summary_loop, args=(token, chat_id, config, stop), daemon=True, name="daily-summary").start()
-    logging.info("Помощник запущен: обход раз в %s сек.; команды Telegram: /favorites", config["poll_interval_seconds"])
+    register_commands(token)
+    logging.info("Помощник запущен: обход раз в %s сек.; команды Telegram по «/»", config["poll_interval_seconds"])
     try:
         while True:
             started = time.monotonic(); scanned = new = matched = 0

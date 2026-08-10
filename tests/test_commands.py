@@ -76,3 +76,40 @@ def test_dashboard_price_filter_survives_junk(query, tmp_path, monkeypatch):
     monkeypatch.setattr(dashboard, "DB", tmp_path / "dash.sqlite3")
     client = dashboard.app.test_client()
     assert client.get(f"/passed?{query}").status_code == 200
+
+
+@pytest.mark.parametrize("entry", olx_watcher.BOT_COMMANDS)
+def test_bot_commands_match_telegram_rules(entry):
+    """Telegram отклоняет весь список целиком, если хоть одна команда не по формату."""
+    import re
+
+    assert re.fullmatch(r"[a-z0-9_]{1,32}", entry["command"])
+    assert 1 <= len(entry["description"]) <= 256
+
+
+def test_every_registered_command_is_handled(tmp_path, monkeypatch):
+    """Подсказка не должна обещать команду, которой бот не знает."""
+    replies = []
+    monkeypatch.setattr(olx_watcher, "telegram_request",
+                        lambda *a, **kw: replies.append(kw) or {"result": {"message_id": 1}})
+    storage = olx_watcher.Storage(tmp_path / "cmd.sqlite3")
+    try:
+        for index, entry in enumerate(olx_watcher.BOT_COMMANDS):
+            replies.clear()
+            update = {"update_id": index,
+                      "message": {"chat": {"id": 1}, "text": f"/{entry['command']}"}}
+            olx_watcher.handle_update("token", storage, update, "1")
+            assert replies, f"/{entry['command']} остаётся без ответа"
+    finally:
+        storage.close()
+
+
+def test_register_commands_survives_telegram_failure(monkeypatch):
+    """Подсказки — удобство: их сбой не должен мешать обходу."""
+    import requests
+
+    def boom(*a, **kw):
+        raise requests.RequestException("Telegram недоступен")
+
+    monkeypatch.setattr(olx_watcher, "telegram_request", boom)
+    olx_watcher.register_commands("token")  # не должно бросить исключение
