@@ -60,6 +60,7 @@ jobs:
         run: |
           sudo systemctl restart olx-watcher.service
           sudo systemctl restart olx-dashboard.service
+          sudo systemctl restart olx-mail.service
 
       - name: Wait for startup
         run: sleep 5
@@ -68,6 +69,7 @@ jobs:
         run: |
           sudo systemctl is-active olx-watcher.service
           sudo systemctl is-active olx-dashboard.service
+          sudo systemctl is-active olx-mail.service
 
       - name: Verify the dashboard actually answers
         run: curl -fsS -o /dev/null http://127.0.0.1:5050/
