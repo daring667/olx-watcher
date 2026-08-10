@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import time
@@ -78,7 +79,7 @@ def connect() -> sqlite3.Connection:
 
 def page(title: str, active: str, body: str) -> str:
     tabs = {"/": "Отсеянные", "/passed": "Прошли фильтр", "/today": "Новые за сегодня",
-            "/mining": "⛏ Майнинговые", "/all": "Все объявления"}
+            "/mining": "⛏ Майнинговые", "/market": "📊 Рынок", "/all": "Все объявления"}
     nav = "".join(f"<a href='{href}' class='{'on' if href == active else ''}'>{escape(name)}</a>"
                   for href, name in tabs.items())
     return f"<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>" \
@@ -156,25 +157,48 @@ def sort_link(key: str, label: str, sort: str, direction: str) -> str:
 def listing_page(title: str, active: str, where: str, params: list, show_reason: bool,
                  default_sort: str = "price") -> str:
     query = request.args.get("q", "").strip()
+    model_filter = request.args.get("model", "").strip()
+    price_min = request.args.get("price_min", "").strip()
+    price_max = request.args.get("price_max", "").strip()
     sort = request.args.get("sort", default_sort)
     direction = request.args.get("dir", "desc" if sort == "new" else "asc")
     clauses, values = [where] if where else [], list(params)
     if query:
         clauses.append("(title LIKE ? OR model LIKE ? OR seller_name LIKE ?)")
         values += [f"%{query}%"] * 3
+    if model_filter:
+        clauses.append("model = ?")
+        values.append(model_filter)
+    # Значения из адресной строки могут быть чем угодно: ?price_min=abc роняло
+    # страницу на int() с 500-й ошибкой. Нечисловой фильтр просто игнорируем.
+    for raw, sql in ((price_min, "price_kzt >= ?"), (price_max, "price_kzt <= ?")):
+        if not raw:
+            continue
+        try:
+            values.append(int(raw.replace(" ", "").replace("\u00a0", "")))
+        except ValueError:
+            continue
+        clauses.append(sql)
     clause = " WHERE " + " AND ".join(clauses) if clauses else ""
     con = connect()
     rows = con.execute(f"SELECT * FROM ads{clause} ORDER BY {order_by(sort, direction)} LIMIT 500",
                        values).fetchall()
     notes = {r["ad_id"]: r["body"] for r in
              con.execute("SELECT ad_id,body FROM notes WHERE id IN (SELECT MAX(id) FROM notes GROUP BY ad_id)")}
+    # Список моделей для выпадающего фильтра
+    all_models = con.execute("SELECT DISTINCT model FROM ads WHERE model IS NOT NULL ORDER BY model").fetchall()
     con.close()
-    # value экранируется: раньше кавычка в поиске ломала форму и пускала разметку.
-    search = (f"<form class=inline><input name=q value='{escape(query, quote=True)}' "
-              f"placeholder='модель, продавец, заголовок…'>"
+    model_options = "".join(
+        f"<option value='{escape(r['model'], quote=True)}'{' selected' if r['model'] == model_filter else ''}>"
+        f"{escape(r['model'])}</option>" for r in all_models)
+    search = (f"<form class=inline>"
+              f"<input name=q value='{escape(query, quote=True)}' placeholder='поиск…'>"
+              f"<select name=model><option value=''>Все модели</option>{model_options}</select>"
+              f"<input name=price_min value='{escape(price_min, quote=True)}' placeholder='от ₸' style='width:80px'>"
+              f"<input name=price_max value='{escape(price_max, quote=True)}' placeholder='до ₸' style='width:80px'>"
               f"<input type=hidden name=sort value='{escape(sort, quote=True)}'>"
               f"<input type=hidden name=dir value='{escape(direction, quote=True)}'>"
-              f"<button>Искать</button></form>")
+              f"<button>Фильтр</button></form>")
     return page(title, active, f"{search}<p>Показано: {len(rows)} · сортировка по столбцу, "
                                f"повторный клик разворачивает</p>"
                                f"{rows_table(rows, notes, show_reason, sort, direction)}")
@@ -285,17 +309,93 @@ def price(ad_id: str):
     con = connect()
     rows = con.execute("SELECT recorded_at,price_kzt FROM price_history WHERE ad_id=? AND price_kzt IS NOT NULL "
                        "ORDER BY recorded_at", (ad_id,)).fetchall()
+    ad = con.execute("SELECT title, model FROM ads WHERE ad_id=?", (ad_id,)).fetchone()
     con.close()
     if not rows:
         return page("История цены", "", "<p>История цены пока отсутствует.</p>"), 404
-    values = [r["price_kzt"] for r in rows]
-    lo, hi = min(values), max(values)
-    spread = max(hi - lo, 1)
-    points = " ".join(f"{20 + i * 560 / max(len(rows) - 1, 1):.0f},{180 - (v - lo) * 140 / spread:.0f}"
-                      for i, v in enumerate(values))
-    return page("История цены", "", f"<svg width=600 height=220><polyline points='{points}' fill=none "
-                                    f"stroke='#1769e0' stroke-width=3/></svg>"
-                                    f"<p>Минимум: {lo:,} ₸ · максимум: {hi:,} ₸ · замеров: {len(values)}</p>")
+    title = (ad["title"] or ad_id) if ad else ad_id
+    labels = json.dumps([datetime.fromtimestamp(r["recorded_at"]).strftime("%d.%m %H:%M") for r in rows])
+    values = json.dumps([r["price_kzt"] for r in rows])
+    chart = f"""
+    <h2>{escape(title[:80])}</h2>
+    <canvas id="priceChart" width="700" height="300"></canvas>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+    <script>
+    new Chart(document.getElementById('priceChart'), {{
+      type: 'line',
+      data: {{
+        labels: {labels},
+        datasets: [{{
+          label: 'Цена (₸)',
+          data: {values},
+          borderColor: '#1769e0',
+          backgroundColor: 'rgba(23,105,224,0.1)',
+          fill: true,
+          tension: 0.3,
+          pointRadius: 4,
+        }}]
+      }},
+      options: {{
+        responsive: true,
+        plugins: {{ legend: {{ display: false }} }},
+        scales: {{
+          y: {{ ticks: {{ callback: v => v.toLocaleString() + ' ₸' }} }},
+          x: {{ ticks: {{ maxTicksLimit: 10 }} }}
+        }}
+      }}
+    }});
+    </script>
+    <p>Минимум: {min(r['price_kzt'] for r in rows):,} ₸ · максимум: {max(r['price_kzt'] for r in rows):,} ₸ · замеров: {len(rows)}</p>
+    """
+    return page("История цены", "", chart)
+
+
+@app.get("/market")
+def market():
+    """Обзор рынка: средние/медианные цены по моделям и количество объявлений."""
+    con = connect()
+    models = con.execute(
+        "SELECT model, COUNT(*) cnt, "
+        "CAST(AVG(price_kzt) AS INTEGER) avg_price, "
+        "MIN(price_kzt) min_price, MAX(price_kzt) max_price "
+        "FROM ads WHERE model IS NOT NULL AND price_kzt IS NOT NULL AND reject_reason = '' "
+        "GROUP BY model ORDER BY avg_price").fetchall()
+    con.close()
+    if not models:
+        return page("Обзор рынка", "/market", "<p>Пока нет данных.</p>")
+    labels = json.dumps([r["model"] for r in models])
+    avg_data = json.dumps([r["avg_price"] for r in models])
+    min_data = json.dumps([r["min_price"] for r in models])
+    max_data = json.dumps([r["max_price"] for r in models])
+    counts = json.dumps([r["cnt"] for r in models])
+    chart = f"""
+    <canvas id="marketChart" height="400"></canvas>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+    <script>
+    new Chart(document.getElementById('marketChart'), {{
+      type: 'bar',
+      data: {{
+        labels: {labels},
+        datasets: [
+          {{ label: 'Мин', data: {min_data}, backgroundColor: 'rgba(10,125,51,0.6)' }},
+          {{ label: 'Средняя', data: {avg_data}, backgroundColor: 'rgba(23,105,224,0.7)' }},
+          {{ label: 'Макс', data: {max_data}, backgroundColor: 'rgba(220,53,69,0.5)' }}
+        ]
+      }},
+      options: {{
+        responsive: true,
+        plugins: {{ legend: {{ position: 'top' }} }},
+        scales: {{
+          y: {{ ticks: {{ callback: v => v.toLocaleString() + ' ₸' }} }}
+        }}
+      }}
+    }});
+    </script>
+    <table><tr><th>Модель</th><th>Кол-во</th><th>Мин</th><th>Средняя</th><th>Макс</th></tr>
+    {''.join(f"<tr><td>{escape(r['model'])}</td><td>{r['cnt']}</td><td>{r['min_price']:,} ₸</td><td>{r['avg_price']:,} ₸</td><td>{r['max_price']:,} ₸</td></tr>" for r in models)}
+    </table>
+    """
+    return page("Обзор рынка", "/market", chart)
 
 
 if __name__ == "__main__":

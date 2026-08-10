@@ -337,8 +337,24 @@ def price_limit(listing: Listing, config: dict) -> int:
     Раньше для распознанной модели брался её normal_max, но поиск устроен по
     вендору, а не по модели: границы моделей остались только для подписи
     «выгодно / нормальная цена». Решает цена и вендор, больше ничего.
+
+    Потолок из /setprice подставляется в config через effective_config(),
+    а не читается здесь: evaluate() зовут и пересчёт, и тесты, куда Storage
+    не передаётся, и параметр оставался бы незаполненным.
     """
     return int(config["max_price_kzt"])
+
+
+def effective_config(config: dict, storage: Storage) -> dict:
+    """Конфиг с потолком цены, переопределённым командой /setprice."""
+    override = storage.setting("override_max_price", "")
+    if not override:
+        return config
+    try:
+        return {**config, "max_price_kzt": int(override)}
+    except ValueError:
+        logging.warning("Ненадёжное значение override_max_price=%r, беру из конфига", override)
+        return config
 
 
 def model_number_in(number: str, title: str) -> bool:
@@ -651,6 +667,23 @@ def daily_summary_loop(token: str, chat_id: str, config: dict, stop: threading.E
     storage = Storage()
     try:
         while not stop.wait(20):
+            # Проверяем напоминания
+            now_ts = int(time.time())
+            reminders = storage.connection.execute(
+                "SELECT key, value FROM meta WHERE key LIKE 'reminder:%'").fetchall()
+            for row in reminders:
+                data = json.loads(row["value"])
+                if now_ts >= data["fire_at"]:
+                    try:
+                        text_msg = f"⏰ <b>Напоминание</b>\n{html.escape(data.get('title', data['ad_id'])[:80])}"
+                        if data.get("url"):
+                            text_msg += f"\n<a href=\"{html.escape(data['url'], quote=True)}\">Открыть объявление</a>"
+                        telegram_request(token, "sendMessage", chat_id=data["chat_id"],
+                                         text=text_msg, parse_mode="HTML")
+                    except requests.RequestException as error:
+                        logging.warning("Не удалось отправить напоминание: %s", safe_error(error))
+                    storage.connection.execute("DELETE FROM meta WHERE key=?", (row["key"],))
+                    storage.connection.commit()
             now = datetime.now()
             # Раньше сравнивалась строка «%H:%M» при опросе раз в 20 секунд:
             # стоило потоку задержаться, минута проскакивала и сводки за день
@@ -723,6 +756,98 @@ def notify_price_drop(token: str, chat_id: str, listing: Listing, old_price: int
     )
 
 
+def handle_search(token: str, storage: Storage, message: dict) -> None:
+    """Поиск объявлений в базе: /search rtx 4070"""
+    chat_id = message["chat"]["id"]
+    query = message.get("text", "")[len("/search"):].strip()
+    if not query:
+        telegram_request(token, "sendMessage", chat_id=chat_id,
+                         text="Использование: <code>/search rtx 4070</code>\nИщет по заголовку, модели и продавцу.",
+                         parse_mode="HTML")
+        return
+    rows = storage.connection.execute(
+        "SELECT * FROM ads WHERE (title LIKE ? OR model LIKE ? OR seller_name LIKE ?) "
+        "AND reject_reason = '' ORDER BY price_kzt IS NULL, price_kzt LIMIT 15",
+        (f"%{query}%",) * 3).fetchall()
+    if not rows:
+        telegram_request(token, "sendMessage", chat_id=chat_id, text=f"По запросу «{html.escape(query)}» ничего не найдено.")
+        return
+    lines = [f"<b>🔍 Результаты по «{html.escape(query)}»</b> ({len(rows)})"]
+    for i, r in enumerate(rows, 1):
+        price = f"{r['price_kzt']:,} ₸" if r["price_kzt"] else "—"
+        model = f" · {html.escape(r['model'])}" if r["model"] else ""
+        gone = " 🚫" if r["is_gone"] else ""
+        lines.append(f"{i}. <b>{price}</b>{model}{gone}\n<a href=\"{html.escape(r['url'], quote=True)}\">{html.escape((r['title'] or '—')[:60])}</a>")
+    telegram_request(token, "sendMessage", chat_id=chat_id, text="\n".join(lines),
+                     parse_mode="HTML", disable_web_page_preview=True)
+
+
+def handle_setprice(token: str, storage: Storage, message: dict) -> None:
+    """Изменение потолка цены на лету: /setprice 80000"""
+    chat_id = message["chat"]["id"]
+    arg = message.get("text", "")[len("/setprice"):].strip()
+    if not arg:
+        current = storage.setting("override_max_price", "")
+        config_price = load_config().get("max_price_kzt", "?")
+        info = f"Текущий потолок: <b>{current or config_price} ₸</b>"
+        if current:
+            info += " (переопределён через бот)"
+        telegram_request(token, "sendMessage", chat_id=chat_id,
+                         text=f"{info}\nИспользование: <code>/setprice 80000</code> или <code>/setprice reset</code>",
+                         parse_mode="HTML")
+        return
+    if arg.lower() in {"reset", "сброс"}:
+        storage.set_setting("override_max_price", "")
+        telegram_request(token, "sendMessage", chat_id=chat_id, text="Потолок цены сброшен к значению из config.yaml.")
+        return
+    try:
+        value = int(arg.replace(" ", "").replace("\u00a0", ""))
+    except ValueError:
+        telegram_request(token, "sendMessage", chat_id=chat_id, text="Укажите число, например: /setprice 80000")
+        return
+    storage.set_setting("override_max_price", str(value))
+    telegram_request(token, "sendMessage", chat_id=chat_id,
+                     text=f"✅ Новый потолок цены: <b>{value:,} ₸</b>\n"
+                          f"Подействует со следующего обхода. Уже сохранённые объявления "
+                          f"пересчитываются командой <code>--backfill-reasons</code>.",
+                     parse_mode="HTML")
+
+
+def handle_remind(token: str, storage: Storage, message: dict) -> None:
+    """Напоминание: /remind ID2345 2d или /remind URL 3h"""
+    chat_id = message["chat"]["id"]
+    parts = message.get("text", "")[len("/remind"):].strip().split()
+    if len(parts) < 2:
+        telegram_request(token, "sendMessage", chat_id=chat_id,
+                         text="Использование: <code>/remind ID... 2d</code>\n"
+                              "Время: 1h, 2d, 30m. Напоминание придёт через указанный срок.",
+                         parse_mode="HTML")
+        return
+    target, delay_str = parts[0], parts[1]
+    # Parse delay
+    match = re.match(r"(\d+)\s*(m|h|d|м|ч|д)", delay_str, re.I)
+    if not match:
+        telegram_request(token, "sendMessage", chat_id=chat_id, text="Не понял время. Примеры: 30m, 2h, 1d")
+        return
+    amount, unit = int(match.group(1)), match.group(2).lower()
+    multiplier = {"m": 60, "h": 3600, "d": 86400, "м": 60, "ч": 3600, "д": 86400}
+    fire_at = int(time.time()) + amount * multiplier[unit]
+    # Resolve ad_id
+    ad_id = target if target.startswith("ID") else ad_id_from_url(target)
+    if not ad_id:
+        ad_id = target  # try as-is
+    row = storage.connection.execute("SELECT title,url FROM ads WHERE ad_id=?", (ad_id,)).fetchone()
+    title = row["title"] if row else ad_id
+    storage.connection.execute(
+        "INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",
+        (f"reminder:{ad_id}:{fire_at}", json.dumps({"chat_id": str(chat_id), "ad_id": ad_id,
+         "title": title, "url": row["url"] if row else "", "fire_at": fire_at})))
+    storage.connection.commit()
+    when = datetime.fromtimestamp(fire_at).strftime("%d.%m %H:%M")
+    telegram_request(token, "sendMessage", chat_id=chat_id,
+                     text=f"⏰ Напоминание установлено на {when}\n{html.escape(title[:80])}", parse_mode="HTML")
+
+
 def update_chat_id(update: dict) -> str:
     callback = update.get("callback_query")
     message = callback.get("message", {}) if callback else update.get("message", {})
@@ -734,7 +859,7 @@ def handle_update(token: str, storage: Storage, update: dict, allowed_chat_id: s
     # username, мог отправить /favorites и увидеть чужое избранное с заметками
     # или поставить мониторинг на паузу через /start.
     sender = update_chat_id(update)
-    if sender and sender != str(allowed_chat_id):
+    if sender and sender not in {cid.strip() for cid in str(allowed_chat_id).split(",")}:
         logging.warning("Проигнорировано сообщение из чужого чата %s", sender)
         return
     callback = update.get("callback_query")
@@ -826,6 +951,12 @@ def handle_update(token: str, storage: Storage, update: dict, allowed_chat_id: s
         telegram_request(token, "sendMessage", chat_id=message["chat"]["id"], text=favorite_text(storage), parse_mode="HTML", disable_web_page_preview=True)
     elif command in {"/start", "/help", "/menu"}:
         telegram_request(token, "sendMessage", chat_id=message["chat"]["id"], text="Панель управления помощником", reply_markup=json.dumps(main_menu(storage), ensure_ascii=False))
+    elif message_text.lower().startswith("/search"):
+        handle_search(token, storage, message)
+    elif message_text.lower().startswith("/setprice"):
+        handle_setprice(token, storage, message)
+    elif message_text.lower().startswith("/remind"):
+        handle_remind(token, storage, message)
 
 
 def main_menu(storage: Storage) -> dict:
@@ -912,6 +1043,7 @@ def backfill_reasons(config: dict) -> None:
     storage = Storage()
     try:
         rows = storage.connection.execute("SELECT * FROM ads").fetchall()
+        config = effective_config(config, storage)
         by_profile = {p["id"]: {**config, **p} for p in config.get("profiles", [])}
         updated = remodelled = sellers_fixed = 0
         for row in rows:
@@ -1036,8 +1168,9 @@ def main(debug_count: int | None = None) -> None:
             profiles = [p for p in profiles if storage.setting(f"profile_enabled:{p['id']}", "1" if p.get("enabled", True) else "0") == "1"]
             seen_ids: set[str] = set()
             complete_urls: list[str] = []
+            cycle_config = effective_config(config, storage)
             for profile in profiles:
-                profile_config = {**config, **profile}
+                profile_config = {**cycle_config, **profile}
                 for search_url in profile_config.get("search_urls", []):
                     # Базовый снимок отдельно на каждую ссылку: добавить новый
                     # город иначе значило бы разослать всю его выдачу как
