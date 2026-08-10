@@ -145,3 +145,59 @@ def test_callback_data_fits_telegram_limit(status):
     for row in olx_watcher.deal_keyboard("IDqZLbh9", status)["inline_keyboard"]:
         for button in row:
             assert len(button["callback_data"].encode()) <= 64
+
+
+def search_reply(tmp_path, monkeypatch, ads, query="gtx 1060"):
+    """Прогоняет /search по подготовленной базе и возвращает текст ответа."""
+    replies = []
+    monkeypatch.setattr(olx_watcher, "telegram_request",
+                        lambda *a, **kw: replies.append(kw) or {"result": {"message_id": 1}})
+    storage = olx_watcher.Storage(tmp_path / "search.sqlite3")
+    try:
+        now = 1
+        for ad_id, title, price, gone, mining in ads:
+            storage.connection.execute(
+                "INSERT INTO ads(ad_id,url,title,price_kzt,status,first_seen,last_seen,"
+                "reject_reason,is_gone,is_mining) VALUES(?,?,?,?,'new',?,?,'',?,?)",
+                (ad_id, f"https://olx.kz/{ad_id}", title, price, now, now, gone, mining))
+        storage.connection.commit()
+        olx_watcher.handle_search(
+            "token", storage, {"chat": {"id": 1}, "text": f"/search {query}"})
+        return replies[0]["text"]
+    finally:
+        storage.close()
+
+
+def test_search_hides_removed_listings(tmp_path, monkeypatch):
+    """Снятое объявление купить нельзя — в выдаче ему не место."""
+    text = search_reply(tmp_path, monkeypatch, [
+        ("ID1", "Palit GTX 1060 6GB", 38000, 1, 0),      # снято
+        ("ID2", "Gtx 1060 Asus", 30000, 0, 0),
+    ])
+    assert "Gtx 1060 Asus" in text
+    assert "Palit GTX 1060 6GB" not in text
+    assert "найдено 1" in text
+
+
+def test_search_reports_real_total_not_page_size(tmp_path, monkeypatch):
+    """В заголовке стояло len(rows) — то есть всегда «15», сколько бы ни нашлось."""
+    ads = [(f"ID{i}", f"GTX 1060 вариант {i}", 10000 + i, 0, 0) for i in range(20)]
+    text = search_reply(tmp_path, monkeypatch, ads)
+    assert "найдено 20" in text
+    assert "показаны 15" in text
+
+
+def test_search_marks_mining_cards(tmp_path, monkeypatch):
+    text = search_reply(tmp_path, monkeypatch, [
+        ("ID1", "ZOTAC P106-100 аналог GTX 1060", 15000, 0, 1),
+    ])
+    assert "⛏" in text
+
+
+def test_search_mentions_removed_when_nothing_left(tmp_path, monkeypatch):
+    """Пустая выдача не должна выглядеть так, будто такого не бывает вовсе."""
+    text = search_reply(tmp_path, monkeypatch, [
+        ("ID1", "Palit GTX 1060 6GB", 38000, 1, 0),
+    ])
+    assert "ничего не найдено" in text
+    assert "Снятых с публикации по этому запросу: 1" in text

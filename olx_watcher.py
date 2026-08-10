@@ -765,19 +765,35 @@ def handle_search(token: str, storage: Storage, message: dict) -> None:
                          text="Использование: <code>/search rtx 4070</code>\nИщет по заголовку, модели и продавцу.",
                          parse_mode="HTML")
         return
+    # Снятые с публикации не показываем: по ним уже ничего не купить, а в
+    # выдаче они занимали половину списка. Смотреть их можно в панели.
+    where = ("(title LIKE ? OR model LIKE ? OR seller_name LIKE ?) "
+             "AND reject_reason = '' AND is_gone = 0")
+    params = (f"%{query}%",) * 3
+    total = storage.connection.execute(
+        f"SELECT COUNT(*) FROM ads WHERE {where}", params).fetchone()[0]
     rows = storage.connection.execute(
-        "SELECT * FROM ads WHERE (title LIKE ? OR model LIKE ? OR seller_name LIKE ?) "
-        "AND reject_reason = '' ORDER BY price_kzt IS NULL, price_kzt LIMIT 15",
-        (f"%{query}%",) * 3).fetchall()
+        f"SELECT * FROM ads WHERE {where} ORDER BY price_kzt IS NULL, price_kzt LIMIT 15",
+        params).fetchall()
     if not rows:
-        telegram_request(token, "sendMessage", chat_id=chat_id, text=f"По запросу «{html.escape(query)}» ничего не найдено.")
+        gone = storage.connection.execute(
+            "SELECT COUNT(*) FROM ads WHERE (title LIKE ? OR model LIKE ? OR seller_name LIKE ?) "
+            "AND is_gone = 1", params).fetchone()[0]
+        tail = f"\nСнятых с публикации по этому запросу: {gone}." if gone else ""
+        telegram_request(token, "sendMessage", chat_id=chat_id,
+                         text=f"По запросу «{html.escape(query)}» ничего не найдено.{tail}")
         return
-    lines = [f"<b>🔍 Результаты по «{html.escape(query)}»</b> ({len(rows)})"]
+    # Раньше в заголовке стояло len(rows) — то есть всегда «15», сколько бы
+    # объявлений ни нашлось. Показываем и найденное, и показанное.
+    header = f"<b>🔍 «{html.escape(query)}» — найдено {total}</b>"
+    if total > len(rows):
+        header += f", показаны {len(rows)} самых дешёвых"
+    lines = [header]
     for i, r in enumerate(rows, 1):
-        price = f"{r['price_kzt']:,} ₸" if r["price_kzt"] else "—"
+        price = f"{r['price_kzt']:,} ₸" if r["price_kzt"] else "цена не распознана"
         model = f" · {html.escape(r['model'])}" if r["model"] else ""
-        gone = " 🚫" if r["is_gone"] else ""
-        lines.append(f"{i}. <b>{price}</b>{model}{gone}\n<a href=\"{html.escape(r['url'], quote=True)}\">{html.escape((r['title'] or '—')[:60])}</a>")
+        mining = " ⛏" if r["is_mining"] else ""
+        lines.append(f"{i}. <b>{price}</b>{model}{mining}\n<a href=\"{html.escape(r['url'], quote=True)}\">{html.escape((r['title'] or '—')[:60])}</a>")
     telegram_request(token, "sendMessage", chat_id=chat_id, text="\n".join(lines),
                      parse_mode="HTML", disable_web_page_preview=True)
 
