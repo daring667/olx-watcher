@@ -113,3 +113,35 @@ def test_register_commands_survives_telegram_failure(monkeypatch):
 
     monkeypatch.setattr(olx_watcher, "telegram_request", boom)
     olx_watcher.register_commands("token")  # не должно бросить исключение
+
+
+def test_deal_keyboard_shows_only_next_step():
+    """Кнопок должно быть немного, и они должны вести вперёд по сделке."""
+    steps = {status: [b["callback_data"].rsplit(":", 1)[1]
+                      for b in olx_watcher.deal_keyboard("ID1", status)["inline_keyboard"][0]]
+             for status in olx_watcher.DEAL_FLOW}
+    assert steps["new"] == ["написал", "архив"]
+    assert steps["написал"] == ["договорился", "архив"]
+    assert steps["договорился"] == ["купил", "архив"]
+    assert steps["купил"] == ["архив"]
+    assert steps["архив"] == ["new"]          # из архива можно вернуть
+
+
+def test_deal_keyboard_shows_current_status():
+    keyboard = olx_watcher.deal_keyboard("ID1", "договорился")
+    assert "договорился" in keyboard["inline_keyboard"][1][0]["text"]
+    assert keyboard["inline_keyboard"][1][1]["callback_data"] == "note:ID1"
+
+
+def test_deal_keyboard_survives_unknown_status():
+    """Статус мог быть выставлен из панели вручную — падать нельзя."""
+    keyboard = olx_watcher.deal_keyboard("ID1", "что-то своё")
+    assert keyboard["inline_keyboard"][0]
+
+
+@pytest.mark.parametrize("status", list(olx_watcher.DEAL_FLOW))
+def test_callback_data_fits_telegram_limit(status):
+    """Telegram обрезает callback_data длиннее 64 байт — кнопка перестаёт работать."""
+    for row in olx_watcher.deal_keyboard("IDqZLbh9", status)["inline_keyboard"]:
+        for button in row:
+            assert len(button["callback_data"].encode()) <= 64

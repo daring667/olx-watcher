@@ -870,6 +870,37 @@ HELP_TEXT = (
 )
 
 
+# Сделка идёт по шагам, поэтому и кнопки показываются по шагам: только
+# следующий разумный ход и способ отказаться. Прежняя сетка из шести кнопок
+# показывала всё сразу и не давала понять, на чём вы остановились.
+# Значения статусов оставлены прежними — по ним фильтрует панель.
+DEAL_FLOW = {
+    "new": [("✉️ Написал продавцу", "написал"), ("🗄 В архив", "архив")],
+    "позвонить": [("✉️ Написал продавцу", "написал"), ("🗄 В архив", "архив")],
+    "написал": [("🤝 Договорился", "договорился"), ("❌ Не сложилось", "архив")],
+    "договорился": [("✅ Купил", "купил"), ("❌ Не сложилось", "архив")],
+    "купил": [("🗄 В архив", "архив")],
+    "архив": [("↩️ Вернуть в работу", "new")],
+}
+DEAL_LABEL = {
+    "new": "не начато", "позвонить": "звонок", "написал": "написал продавцу",
+    "договорился": "договорился", "купил": "куплено", "архив": "в архиве",
+}
+
+
+def deal_keyboard(ad_id: str, deal_status: str) -> dict:
+    """Следующий шаг сделки плюс строка с текущим состоянием."""
+    steps = DEAL_FLOW.get(deal_status or "new", DEAL_FLOW["new"])
+    label = DEAL_LABEL.get(deal_status or "new", deal_status or "не начато")
+    return {"inline_keyboard": [
+        [{"text": text, "callback_data": f"d:{ad_id}:{value}"} for text, value in steps],
+        # Первая кнопка — просто индикатор: нажатие переставляет тот же статус,
+        # то есть ничего не меняет, зато состояние видно, не открывая панель.
+        [{"text": f"● Сейчас: {label}", "callback_data": f"d:{ad_id}:{deal_status or 'new'}"},
+         {"text": "📝 Заметка", "callback_data": f"note:{ad_id}"}],
+    ]}
+
+
 def register_commands(token: str) -> None:
     """Регистрирует меню команд, чтобы Telegram подсказывал их по «/».
 
@@ -937,31 +968,14 @@ def handle_update(token: str, storage: Storage, update: dict, allowed_chat_id: s
             status = "interested" if action == "i" else "ignored"
             row = storage.set_status(ad_id, status)
             answer = "Добавлено в избранное" if status == "interested" else "Больше не покажу это объявление"
-            keyboard = {"inline_keyboard": [[
-                {"text": "📞 Позвонить", "callback_data": f"d:{ad_id}:позвонить"},
-                {"text": "✉️ Написал", "callback_data": f"d:{ad_id}:написал"},
-            ], [
-                {"text": "🤝 Договорился", "callback_data": f"d:{ad_id}:договорился"},
-                {"text": "✅ Купил", "callback_data": f"d:{ad_id}:купил"},
-            ], [
-                {"text": "📝 Заметка", "callback_data": f"note:{ad_id}"},
-                {"text": "🗄 Архив", "callback_data": f"d:{ad_id}:архив"},
-            ]]}
+            current = row["deal_status"] if row else "new"
+            keyboard = deal_keyboard(ad_id, current)
             if action == "n":
                 keyboard = {"inline_keyboard": []}
         elif action == "d":
             storage.set_deal_status(ad_id, deal)
-            row, answer = True, f"Статус: {deal}"
-            keyboard = {"inline_keyboard": [[
-                {"text": "📞 Позвонить", "callback_data": f"d:{ad_id}:позвонить"},
-                {"text": "✉️ Написал", "callback_data": f"d:{ad_id}:написал"},
-            ], [
-                {"text": "🤝 Договорился", "callback_data": f"d:{ad_id}:договорился"},
-                {"text": "✅ Купил", "callback_data": f"d:{ad_id}:купил"},
-            ], [
-                {"text": "📝 Заметка", "callback_data": f"note:{ad_id}"},
-                {"text": "🗄 Архив", "callback_data": f"d:{ad_id}:архив"},
-            ]]}
+            row, answer = True, f"Статус: {DEAL_LABEL.get(deal, deal)}"
+            keyboard = deal_keyboard(ad_id, deal)
         else:
             chat_id = callback["message"]["chat"]["id"]
             storage.connection.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (f"pending_note:{chat_id}", ad_id)); storage.connection.commit()
