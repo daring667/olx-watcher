@@ -9,6 +9,10 @@
 Одинаковые ссылки разных пользователей читаются одним запросом — нагрузка на
 OLX растёт с числом разных поисков, а не с числом подписчиков.
 
+Управление — кнопками, а не командами: меню живёт в одном сообщении и
+перерисовывается на месте, чат не засоряется. Команды остались как запасной
+вход. Вся работа с базой — в feed_db.FeedDB.
+
 Режим видеокарт владельца это не трогает: свои таблицы, свой поток.
 """
 from __future__ import annotations
@@ -16,10 +20,9 @@ from __future__ import annotations
 import html
 import json
 import logging
+import math
 import os
 import re
-import sqlite3
-import statistics
 import threading
 import time
 from datetime import datetime
@@ -31,11 +34,11 @@ from curl_cffi import requests as impersonated
 # Через модуль, а не `from … import`: тесты подменяют olx_watcher.telegram_request,
 # и подмена должна действовать и здесь.
 import olx_watcher as w
-
-DAY = 86400
+from feed_db import DAY, FeedDB
 
 DEFAULTS = {
     "enabled": False,
+    "brand": "OLX Радар",
     "poll_seconds": 120,
     "url_delay_seconds": 2,
     "seed_pages": 3,
@@ -43,6 +46,8 @@ DEFAULTS = {
     "max_watches": 3,
     "min_samples": 8,
     "window_days": 30,
+    "price_kzt": 5000,
+    "period_days": 30,
     "proxy": "",
     "payment_text": "Подписка платная. Напишите владельцу бота, чтобы продлить доступ.",
 }
@@ -51,27 +56,13 @@ DEFAULTS = {
 # неё свежие объявления оказались бы где-то в глубине выдачи.
 ORDER_KEY, ORDER_VALUE = "search[order]", "created_at:desc"
 OLX_URL = re.compile(r"https?://(?:www\.|m\.)?olx\.kz/[^\s<>\"']+", re.I)
+FILTER_STEPS = (0, 10, 20, 30, 40)
 
 PUBLIC_COMMANDS = [
-    {"command": "start", "description": "Как пользоваться ботом"},
+    {"command": "start", "description": "Главное меню"},
     {"command": "list", "description": "Мои поиски"},
-    {"command": "discount", "description": "Только дешевле рынка: /discount 15"},
-    {"command": "status", "description": "Подписка и оплата"},
-    {"command": "help", "description": "Помощь"},
+    {"command": "help", "description": "Как это работает"},
 ]
-
-HELP_TEXT = (
-    "<b>Как пользоваться</b>\n"
-    "1. Откройте OLX, выберите категорию, город и фильтры (цена, состояние…).\n"
-    "2. Скопируйте ссылку из адресной строки и пришлите её сюда.\n"
-    "3. Новые объявления по этому поиску будут приходить в течение 1–2 минут "
-    "после публикации — с оценкой, насколько цена ниже или выше рынка.\n"
-    "Чем точнее поиск («iPhone 13 128GB», а не просто «iPhone»), тем точнее оценка.\n\n"
-    "/list — мои поиски и их отключение\n"
-    "/discount 15 — присылать только объявления на 15% и больше дешевле рынка "
-    "(<code>/discount 0</code> — все подряд)\n"
-    "/status — подписка и оплата"
-)
 
 
 def settings(config: dict | None) -> dict:
@@ -83,32 +74,6 @@ def settings(config: dict | None) -> dict:
     if payment:
         cfg["payment_text"] = payment.replace("\\n", "\n")
     return cfg
-
-
-def ensure_schema(connection: sqlite3.Connection) -> None:
-    connection.executescript("""
-        CREATE TABLE IF NOT EXISTS users (
-          chat_id TEXT PRIMARY KEY, username TEXT, first_name TEXT,
-          joined_at INTEGER NOT NULL, paid_until INTEGER NOT NULL,
-          min_discount INTEGER NOT NULL DEFAULT 0,
-          blocked INTEGER NOT NULL DEFAULT 0, expired_notified INTEGER NOT NULL DEFAULT 0
-        );
-        CREATE TABLE IF NOT EXISTS watches (
-          id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT NOT NULL,
-          search_url TEXT NOT NULL, title TEXT NOT NULL, created_at INTEGER NOT NULL,
-          UNIQUE(chat_id, search_url)
-        );
-        CREATE TABLE IF NOT EXISTS feed_ads (
-          search_url TEXT NOT NULL, ad_id TEXT NOT NULL, title TEXT, price_kzt INTEGER,
-          url TEXT, first_seen INTEGER NOT NULL, PRIMARY KEY(search_url, ad_id)
-        );
-        CREATE TABLE IF NOT EXISTS feed_urls (
-          search_url TEXT PRIMARY KEY, baseline_done INTEGER NOT NULL DEFAULT 0,
-          last_polled INTEGER
-        );
-        CREATE INDEX IF NOT EXISTS feed_ads_market ON feed_ads(search_url, first_seen);
-    """)
-    connection.commit()
 
 
 # --- Ссылки -----------------------------------------------------------------
@@ -145,59 +110,30 @@ def watch_title(search_url: str) -> str:
     return label or "поиск OLX"
 
 
-# --- Пользователи и доступ --------------------------------------------------
-def register_user(connection: sqlite3.Connection, chat: dict, trial_days: int) -> sqlite3.Row:
-    chat_id = str(chat.get("id"))
-    now = int(time.time())
-    connection.execute(
-        "INSERT OR IGNORE INTO users(chat_id,username,first_name,joined_at,paid_until) VALUES(?,?,?,?,?)",
-        (chat_id, chat.get("username"), chat.get("first_name"), now, now + trial_days * DAY))
-    # Пользователь, заблокировавший и снова запустивший бота, должен снова
-    # получать уведомления.
-    connection.execute("UPDATE users SET blocked=0, username=COALESCE(?,username) WHERE chat_id=?",
-                       (chat.get("username"), chat_id))
-    connection.commit()
-    return connection.execute("SELECT * FROM users WHERE chat_id=?", (chat_id,)).fetchone()
-
-
-def is_active(user: sqlite3.Row | None, owner_ids: set[str]) -> bool:
+# --- Доступ и даты ----------------------------------------------------------
+def is_active(user, owner_ids: set[str]) -> bool:
     if user is None:
         return False
     return user["chat_id"] in owner_ids or user["paid_until"] > time.time()
-
-
-def grant(connection: sqlite3.Connection, target: str, days: int) -> sqlite3.Row | None:
-    """Продлевает доступ от более поздней из дат: сейчас или текущий конец."""
-    target = target.strip()
-    column = "username" if target.startswith("@") else "chat_id"
-    user = connection.execute(f"SELECT * FROM users WHERE {column}=?", (target.lstrip("@"),)).fetchone()
-    if not user:
-        return None
-    until = max(int(time.time()), user["paid_until"]) + days * DAY
-    connection.execute("UPDATE users SET paid_until=?, expired_notified=0 WHERE chat_id=?",
-                       (until, user["chat_id"]))
-    connection.commit()
-    return connection.execute("SELECT * FROM users WHERE chat_id=?", (user["chat_id"],)).fetchone()
 
 
 def date_text(ts: int) -> str:
     return datetime.fromtimestamp(ts).strftime("%d.%m.%Y %H:%M")
 
 
+def left_text(ts: int) -> str:
+    """«ещё 3 дн.» / «ещё 5 ч.» — сколько осталось до конца доступа."""
+    seconds = ts - time.time()
+    if seconds >= DAY:
+        return f"ещё {math.ceil(seconds / DAY)} дн."
+    return f"ещё {max(1, math.ceil(seconds / 3600))} ч."
+
+
+def money(value: int | None) -> str:
+    return f"{value:,} ₸".replace(",", " ") if value is not None else "—"
+
+
 # --- Оценка рынка -----------------------------------------------------------
-def market(connection: sqlite3.Connection, search_url: str, window_days: int) -> tuple[int | None, int]:
-    """Медиана цен выдачи за окно и число объявлений, по которым она посчитана.
-
-    Медиана, а не среднее: одно «iPhone за 1 ₸» или опечатка с лишним нулём
-    сдвинули бы среднее на десятки процентов, медиану — почти нет.
-    """
-    since = int(time.time()) - window_days * DAY
-    prices = [row[0] for row in connection.execute(
-        "SELECT price_kzt FROM feed_ads WHERE search_url=? AND first_seen>=? AND price_kzt>0",
-        (search_url, since))]
-    return (int(statistics.median(prices)) if prices else None), len(prices)
-
-
 def discount_percent(price: int | None, median: int | None) -> int | None:
     if not price or not median:
         return None
@@ -210,7 +146,7 @@ def market_line(price: int | None, median: int | None, count: int, min_samples: 
     if median is None or count < min_samples:
         return f"📊 Пока мало данных для оценки рынка ({count} объявл.)"
     pct = discount_percent(price, median)
-    basis = f"медиана {median:,} ₸ по {count} объявл."
+    basis = f"медиана {money(median)} по {count} объявл."
     if pct >= 60:
         # Слишком хорошая цена чаще всего приманка мошенника или опечатка.
         return f"⚠️ На {pct}% дешевле рынка — подозрительно, проверьте продавца ({basis})"
@@ -235,33 +171,14 @@ def fetch_cards(session, search_url: str, page: int = 1) -> list[w.Listing]:
     return w.extract_listings(search_url, response.text, 60)
 
 
-def store_cards(connection: sqlite3.Connection, search_url: str, cards: list[w.Listing]) -> None:
-    now = int(time.time())
-    connection.executemany(
-        "INSERT OR IGNORE INTO feed_ads(search_url,ad_id,title,price_kzt,url,first_seen) VALUES(?,?,?,?,?,?)",
-        [(search_url, c.ad_id, c.title, c.price_kzt, c.url, now) for c in cards])
-    connection.commit()
-
-
-def active_subscribers(connection: sqlite3.Connection, search_url: str, owner_ids: set[str]) -> list[sqlite3.Row]:
-    rows = connection.execute(
-        "SELECT w.id watch_id, u.* FROM watches w JOIN users u ON u.chat_id=w.chat_id "
-        "WHERE w.search_url=? AND u.blocked=0", (search_url,)).fetchall()
-    return [row for row in rows if is_active(row, owner_ids)]
-
-
-def poll_url(connection: sqlite3.Connection, session, token: str, search_url: str,
-             cfg: dict, owner_ids: set[str]) -> int:
+def poll_url(db: FeedDB, session, token: str, search_url: str, cfg: dict, owner_ids: set[str]) -> int:
     """Читает одну выдачу; возвращает число разосланных уведомлений."""
-    state = connection.execute("SELECT * FROM feed_urls WHERE search_url=?", (search_url,)).fetchone()
     cards = fetch_cards(session, search_url)
-    connection.execute("INSERT OR IGNORE INTO feed_urls(search_url) VALUES(?)", (search_url,))
-    connection.execute("UPDATE feed_urls SET last_polled=? WHERE search_url=?", (int(time.time()), search_url))
-    if not state or not state["baseline_done"]:
+    if not db.url_baseline_done(search_url):
         # Первый проход ничего не рассылает: всё на странице уже опубликовано
         # раньше. Заодно берём ещё несколько страниц, чтобы оценка рынка
         # работала сразу, а не через неделю накопления.
-        store_cards(connection, search_url, cards)
+        db.store_cards(search_url, cards)
         for page in range(2, int(cfg["seed_pages"]) + 1):
             try:
                 more = fetch_cards(session, search_url, page)
@@ -269,46 +186,51 @@ def poll_url(connection: sqlite3.Connection, session, token: str, search_url: st
                 break
             if not more:
                 break
-            store_cards(connection, search_url, more)
+            db.store_cards(search_url, more)
             time.sleep(float(cfg["url_delay_seconds"]))
-        connection.execute("UPDATE feed_urls SET baseline_done=1 WHERE search_url=?", (search_url,))
-        connection.commit()
+        db.mark_polled(search_url, baseline_done=True)
         logging.info("Публичный поиск: базовый снимок %s", search_url)
         return 0
-    known = {row[0] for row in connection.execute(
-        "SELECT ad_id FROM feed_ads WHERE search_url=? AND ad_id IN (%s)" % ",".join("?" * len(cards)),
-        [search_url, *[c.ad_id for c in cards]])} if cards else set()
+    db.mark_polled(search_url)
+    known = db.known_ads(search_url, [c.ad_id for c in cards])
     fresh = [c for c in cards if c.ad_id not in known]
     if not fresh:
-        connection.commit()
         return 0
     # Рынок считаем до добавления новинок: иначе объявление сравнивалось бы
     # само с собой.
-    median, count = market(connection, search_url, int(cfg["window_days"]))
-    store_cards(connection, search_url, fresh)
-    subscribers = active_subscribers(connection, search_url, owner_ids)
+    median, count = db.market(search_url, int(cfg["window_days"]))
+    db.store_cards(search_url, fresh)
+    subscribers = [u for u in db.subscribers(search_url) if is_active(u, owner_ids)]
+    min_samples = int(cfg["min_samples"])
     sent = 0
     for card in fresh:
-        pct = discount_percent(card.price_kzt, median) if count >= int(cfg["min_samples"]) else None
-        line = market_line(card.price_kzt, median, count, int(cfg["min_samples"]))
+        pct = discount_percent(card.price_kzt, median) if count >= min_samples else None
+        line = market_line(card.price_kzt, median, count, min_samples)
         for user in subscribers:
             if user["min_discount"] > 0 and (pct is None or pct < user["min_discount"]):
                 continue
-            if send_card(connection, token, user, card, line):
+            if send_card(db, token, user, card, line, pct):
                 sent += 1
     return sent
 
 
 def card_caption(card: w.Listing, line: str) -> str:
-    price = f"{card.price_kzt:,} ₸" if card.price_kzt is not None else "не указана"
     return (f"🆕 <b>{html.escape(card.title or 'Новое объявление')}</b>\n"
-            f"Цена: <b>{price}</b>\n" + (f"{line}\n" if line else "") +
-            f'\n<a href="{html.escape(card.url, quote=True)}">Открыть на OLX</a>')
+            f"💰 <b>{money(card.price_kzt) if card.price_kzt is not None else 'цена не указана'}</b>\n"
+            + (f"{line}\n" if line else ""))
 
 
-def send_card(connection: sqlite3.Connection, token: str, user: sqlite3.Row, card: w.Listing, line: str) -> bool:
-    keyboard = json.dumps({"inline_keyboard": [[
-        {"text": "🔕 Отключить этот поиск", "callback_data": f"f:del:{user['watch_id']}"}]]}, ensure_ascii=False)
+def card_markup(delivery_id: int, url: str, favorite: bool, paused: bool) -> str:
+    return markup(
+        [link("🔗 Открыть на OLX", url)],
+        [button("★ В избранном" if favorite else "⭐ В избранное", f"u:fav:{delivery_id}"),
+         button("▶️ Возобновить поиск" if paused else "⏸ Пауза поиска", f"u:np:{delivery_id}")],
+    )
+
+
+def send_card(db: FeedDB, token: str, user, card: w.Listing, line: str, pct: int | None = None) -> bool:
+    delivery_id = db.record_delivery(user["chat_id"], user["watch_id"], card, pct)
+    keyboard = card_markup(delivery_id, card.url, False, False)
     caption = card_caption(card, line)
     try:
         try:
@@ -320,59 +242,66 @@ def send_card(connection: sqlite3.Connection, token: str, user: sqlite3.Row, car
             if is_blocked_error(error):
                 raise
             w.telegram_request(token, "sendMessage", chat_id=user["chat_id"], text=caption,
-                               parse_mode="HTML", reply_markup=keyboard)
+                               parse_mode="HTML", reply_markup=keyboard, disable_web_page_preview=True)
         return True
     except requests.RequestException as error:
+        db.c.execute("DELETE FROM deliveries WHERE id=?", (delivery_id,))
+        db.c.execute("UPDATE watches SET sent_count=MAX(sent_count-1,0) WHERE id=?", (user["watch_id"],))
+        db.c.commit()
         if is_blocked_error(error):
             # Пользователь заблокировал бота: дальше слать бессмысленно, а
             # Telegram за упорные попытки начинает ограничивать весь бот.
-            connection.execute("UPDATE users SET blocked=1 WHERE chat_id=?", (user["chat_id"],))
-            connection.commit()
+            db.set_user(user["chat_id"], blocked=1)
         logging.warning("Публичный поиск: не отправлено %s: %s", user["chat_id"], w.safe_error(error))
         return False
 
 
 def is_blocked_error(error: Exception) -> bool:
     text = str(error).lower()
-    return "blocked" in text or "deactivated" in text or "chat not found" in text or "403" in text
+    return ("blocked" in text or "deactivated" in text or "chat not found" in text
+            or text.startswith("403"))
 
 
-def notify_expired(connection: sqlite3.Connection, token: str, cfg: dict, owner_ids: set[str]) -> None:
-    """Один раз сообщает об окончании доступа — с реквизитами для оплаты."""
-    rows = connection.execute(
-        "SELECT * FROM users WHERE paid_until<? AND expired_notified=0 AND blocked=0 "
-        "AND chat_id IN (SELECT chat_id FROM watches)", (int(time.time()),)).fetchall()
-    for user in rows:
+def notify_access(db: FeedDB, token: str, cfg: dict, owner_ids: set[str]) -> None:
+    """Напоминание за сутки до конца доступа и сообщение, когда он кончился."""
+    renew = markup([button("💳 Продлить доступ", "u:sub")])
+    for user in db.expiring_users(DAY):
         if user["chat_id"] in owner_ids:
             continue
-        try:
-            w.telegram_request(token, "sendMessage", chat_id=user["chat_id"], parse_mode="HTML",
-                               text="⏳ <b>Доступ закончился</b> — новые объявления больше не приходят.\n\n"
-                                    + cfg["payment_text"])
-        except requests.RequestException as error:
-            logging.warning("Не удалось сообщить об окончании доступа: %s", w.safe_error(error))
-        connection.execute("UPDATE users SET expired_notified=1 WHERE chat_id=?", (user["chat_id"],))
-        connection.commit()
+        safe_send(db, token, user["chat_id"],
+                  f"⏰ <b>Доступ закончится {date_text(user['paid_until'])}</b>\n"
+                  "Продлите подписку, чтобы объявления продолжали приходить без перерыва.",
+                  reply_markup=renew)
+        db.set_user(user["chat_id"], expiring_notified=1)
+    for user in db.expired_users():
+        if user["chat_id"] in owner_ids:
+            continue
+        safe_send(db, token, user["chat_id"],
+                  "⏳ <b>Доступ закончился</b> — новые объявления больше не приходят.\n"
+                  "Ваши поиски и избранное сохранены: продлите подписку, и всё продолжит работать.",
+                  reply_markup=renew)
+        db.set_user(user["chat_id"], expired_notified=1)
+        db.log(user["chat_id"], "expired")
 
 
 def feed_loop(token: str, config: dict, owner_ids: set[str], stop: threading.Event) -> None:
     cfg = settings(config)
     storage = w.Storage()
-    connection = storage.connection
-    ensure_schema(connection)
+    db = FeedDB(storage.connection)
     session = make_session(cfg["proxy"])
     try:
         while not stop.is_set():
             started = time.monotonic()
-            urls = [row[0] for row in connection.execute("SELECT DISTINCT search_url FROM watches")]
-            sent = 0
+            urls = db.polled_urls()
+            sent = polled = 0
             for search_url in urls:
                 if stop.is_set():
                     break
-                if not active_subscribers(connection, search_url, owner_ids):
+                if not any(is_active(u, owner_ids) for u in db.subscribers(search_url)):
                     continue  # у всех подписчиков истёк доступ — OLX зря не дёргаем
+                polled += 1
                 try:
-                    sent += poll_url(connection, session, token, search_url, cfg, owner_ids)
+                    sent += poll_url(db, session, token, search_url, cfg, owner_ids)
                 except w.NETWORK_ERRORS as error:
                     storage.record_error("Публичный поиск OLX", error)
                     logging.warning("Публичный поиск: %s — %s", search_url, error)
@@ -380,79 +309,511 @@ def feed_loop(token: str, config: dict, owner_ids: set[str], stop: threading.Eve
                     storage.record_error("Публичный поиск", error)
                     logging.exception("Публичный поиск: ошибка %s", search_url)
                 stop.wait(float(cfg["url_delay_seconds"]))
-            notify_expired(connection, token, cfg, owner_ids)
-            if urls:
+            try:
+                notify_access(db, token, cfg, owner_ids)
+            except Exception:
+                logging.exception("Публичный поиск: напоминания о доступе")
+            if polled:
                 logging.info("Публичный поиск: выдач %d, отправлено %d, %.1f сек.",
-                             len(urls), sent, time.monotonic() - started)
+                             polled, sent, time.monotonic() - started)
             stop.wait(max(5.0, float(cfg["poll_seconds"]) - (time.monotonic() - started)))
     finally:
         storage.close()
 
 
-# --- Telegram ---------------------------------------------------------------
-def send(token: str, chat_id, text: str, **extra) -> None:
-    w.telegram_request(token, "sendMessage", chat_id=chat_id, text=text, parse_mode="HTML",
-                       disable_web_page_preview=True, **extra)
+# --- Кнопки и экраны --------------------------------------------------------
+def button(text: str, data: str) -> dict:
+    return {"text": text, "callback_data": data}
 
 
-def status_text(user: sqlite3.Row, cfg: dict, owner_ids: set[str]) -> str:
+def link(text: str, url: str) -> dict:
+    return {"text": text, "url": url}
+
+
+def markup(*rows) -> str:
+    return json.dumps({"inline_keyboard": [list(row) for row in rows if row]}, ensure_ascii=False)
+
+
+HOME = button("🏠 Меню", "u:home")
+
+
+def send(token: str, chat_id, text: str, **extra) -> dict:
+    return w.telegram_request(token, "sendMessage", chat_id=chat_id, text=text, parse_mode="HTML",
+                              disable_web_page_preview=True, **extra)
+
+
+def safe_send(db: FeedDB, token: str, chat_id, text: str, **extra) -> bool:
+    try:
+        send(token, chat_id, text, **extra)
+        return True
+    except requests.RequestException as error:
+        if is_blocked_error(error):
+            db.set_user(chat_id, blocked=1)
+        logging.warning("Не отправлено %s: %s", chat_id, w.safe_error(error))
+        return False
+
+
+def show(token: str, chat_id, screen: tuple[str, str], message: dict | None = None) -> None:
+    """Показывает экран меню: перерисовывает то же сообщение, если можно.
+
+    Меню живёт в одном сообщении, и переходы не засоряют чат. Сообщение с
+    фото (карточку объявления) в текст не превратить — тогда шлём новое.
+    """
+    text, keyboard = screen
+    if message and message.get("text") is not None:
+        try:
+            w.telegram_request(token, "editMessageText", chat_id=chat_id, message_id=message["message_id"],
+                               text=text, parse_mode="HTML", disable_web_page_preview=True,
+                               reply_markup=keyboard)
+            return
+        except requests.RequestException as error:
+            if "not modified" in str(error):
+                return
+    send(token, chat_id, text, reply_markup=keyboard)
+
+
+def access_line(user, owner_ids: set[str]) -> str:
     if user["chat_id"] in owner_ids:
-        return "Вы владелец бота — доступ без ограничений."
-    if is_active(user, owner_ids):
-        return f"✅ Доступ активен до <b>{date_text(user['paid_until'])}</b>.\n\n{cfg['payment_text']}"
-    return f"⏳ Доступ закончился {date_text(user['paid_until'])}.\n\n{cfg['payment_text']}"
+        return "👑 Владелец — без ограничений"
+    if not is_active(user, owner_ids):
+        return "⏳ <b>Доступ закончился</b> — новые объявления не приходят"
+    kind = "✅ Подписка" if user["plan"] == "paid" else "🎁 Пробный доступ"
+    return f"{kind} до {date_text(user['paid_until'])} ({left_text(user['paid_until'])})"
 
 
-def list_reply(connection: sqlite3.Connection, chat_id: str) -> tuple[str, dict]:
-    rows = connection.execute("SELECT * FROM watches WHERE chat_id=? ORDER BY id", (chat_id,)).fetchall()
-    if not rows:
-        return "Поисков пока нет. Пришлите ссылку на выдачу OLX — и я начну следить.", {"inline_keyboard": []}
-    lines = ["<b>Ваши поиски</b>"]
-    buttons = []
-    for index, row in enumerate(rows, 1):
-        lines.append(f'{index}. <a href="{html.escape(row["search_url"], quote=True)}">'
-                     f'{html.escape(row["title"])}</a>')
-        buttons.append([{"text": f"🗑 Удалить {index}", "callback_data": f"f:del:{row['id']}"}])
-    return "\n".join(lines), {"inline_keyboard": buttons}
+def filter_text(value: int) -> str:
+    return "все новые объявления" if not value else f"только на {value}%+ дешевле рынка"
 
 
-def add_watch(token: str, connection: sqlite3.Connection, user: sqlite3.Row, text: str,
-              cfg: dict, owner_ids: set[str]) -> None:
+def home_screen(db: FeedDB, user, cfg: dict, owner_ids: set[str], greeting: str = "") -> tuple[str, str]:
     chat_id = user["chat_id"]
+    watches = db.watches(chat_id)
+    paused = sum(1 for row in watches if row["paused"])
+    owner = chat_id in owner_ids
+    limit = "∞" if owner else cfg["max_watches"]
+    text = (greeting or f"🔎 <b>{html.escape(cfg['brand'])}</b>\n"
+            "Новые объявления с OLX через 1–2 минуты после публикации.\n") + (
+        f"\n{access_line(user, owner_ids)}\n"
+        f"📋 Поиски: <b>{len(watches)}</b> из {limit}" + (f" (на паузе {paused})" if paused else "") + "\n"
+        f"🎯 Присылаю: {filter_text(user['min_discount'])}\n"
+        f"⭐ В избранном: {db.count('favorites', chat_id)}")
+    rows = []
+    if not is_active(user, owner_ids):
+        rows.append([button("💳 Продлить доступ", "u:sub")])
+    rows += [
+        [button("➕ Добавить поиск", "u:add"), button("📋 Мои поиски", "u:list")],
+        [button("⭐ Избранное", "u:favs"), button("🎯 Фильтр выгоды", "u:filter")],
+        [button("💳 Подписка", "u:sub"), button("❓ Как это работает", "u:help")],
+    ]
+    if owner:
+        rows.append([button("👑 Админка", "a:home"), button("🎮 Видеокарты", "u:gpu")])
+    return text, markup(*rows)
+
+
+def add_screen(db: FeedDB, user, cfg: dict, owner_ids: set[str]) -> tuple[str, str]:
+    used = db.count("watches", user["chat_id"])
+    owner = user["chat_id"] in owner_ids
+    free = "без ограничений" if owner else f"{max(0, int(cfg['max_watches']) - used)} из {cfg['max_watches']}"
+    return ("➕ <b>Новый поиск</b>\n\n"
+            "1️⃣ Откройте OLX, выберите категорию и город.\n"
+            "2️⃣ Выставьте фильтры: цена, состояние, ключевые слова.\n"
+            "3️⃣ Скопируйте ссылку из адресной строки и пришлите её сюда, в чат.\n\n"
+            "💡 Чем точнее поиск («iPhone 13 128GB», а не просто «iPhone»), тем точнее оценка цены.\n\n"
+            f"Свободно мест: {free}",
+            markup([link("🌐 Открыть OLX", "https://www.olx.kz/")], [button("⬅️ Назад", "u:home")]))
+
+
+def list_screen(db: FeedDB, user, cfg: dict, owner_ids: set[str]) -> tuple[str, str]:
+    watches = db.watches(user["chat_id"])
+    if not watches:
+        return ("📋 <b>Мои поиски</b>\n\nПока пусто. Добавьте первый поиск — и я начну присылать "
+                "новые объявления.", markup([button("➕ Добавить поиск", "u:add")], [HOME]))
+    rows = [[button(f"{'⏸' if row['paused'] else '🟢'} {row['title'][:48]}", f"u:w:{row['id']}")]
+            for row in watches]
+    limit = "∞" if user["chat_id"] in owner_ids else cfg["max_watches"]
+    return (f"📋 <b>Мои поиски</b> ({len(watches)} из {limit})\n\n🟢 — активен, ⏸ — на паузе.\n"
+            "Нажмите на поиск, чтобы открыть его.",
+            markup(*rows, [button("➕ Добавить", "u:add"), HOME]))
+
+
+def watch_screen(db: FeedDB, watch, cfg: dict) -> tuple[str, str]:
+    median, count = db.market(watch["search_url"], int(cfg["window_days"]))
+    market = (f"медиана <b>{money(median)}</b> по {count} объявл. за {cfg['window_days']} дн."
+              if median and count >= int(cfg["min_samples"]) else f"пока мало данных ({count} объявл.)")
+    last = f"\n🕐 Последнее: {date_text(watch['last_sent_at'])}" if watch["last_sent_at"] else ""
+    status = "⏸ на паузе" if watch["paused"] else "🟢 активен"
+    toggle = button("▶️ Возобновить", f"u:wr:{watch['id']}") if watch["paused"] \
+        else button("⏸ Пауза", f"u:wp:{watch['id']}")
+    return (f"🔍 <b>{html.escape(watch['title'])}</b>\n\n"
+            f"Статус: {status}\n📨 Прислано объявлений: {watch['sent_count']}{last}\n"
+            f"📊 Рынок: {market}\n"
+            f"📅 Добавлен: {date_text(watch['created_at'])}",
+            markup([link("🌐 Открыть выдачу на OLX", watch["search_url"])],
+                   [toggle, button("🗑 Удалить", f"u:wd:{watch['id']}")],
+                   [button("⬅️ Мои поиски", "u:list"), HOME]))
+
+
+def favorites_screen(db: FeedDB, user) -> tuple[str, str]:
+    favorites = db.favorites(user["chat_id"])
+    if not favorites:
+        return ("⭐ <b>Избранное</b>\n\nПока пусто. Нажимайте «⭐ В избранное» под объявлениями, "
+                "чтобы не потерять интересные варианты.", markup([HOME]))
+    lines = [f"⭐ <b>Избранное</b> ({len(favorites)})\n"]
+    for index, row in enumerate(favorites, 1):
+        lines.append(f'{index}. <a href="{html.escape(row["url"] or "", quote=True)}">'
+                     f'{html.escape((row["title"] or "—")[:60])}</a> — {money(row["price_kzt"])}')
+    deletes = [button(f"🗑 {i}", f"u:fd:{row['id']}") for i, row in enumerate(favorites, 1)]
+    rows = [deletes[i:i + 5] for i in range(0, len(deletes), 5)]
+    return "\n".join(lines) + "\n\nКнопки 🗑 — убрать из избранного.", markup(*rows, [HOME])
+
+
+def filter_screen(user) -> tuple[str, str]:
+    current = user["min_discount"]
+    options = [button(("✓ " if value == current else "") + ("Все" if not value else f"от {value}%"),
+                      f"u:f:{value}") for value in FILTER_STEPS]
+    return ("🎯 <b>Фильтр выгоды</b>\n\n"
+            "Цену каждого нового объявления я сравниваю с медианой по вашему поиску за 30 дней.\n\n"
+            "• <b>Все</b> — присылаю каждое новое объявление.\n"
+            "• <b>от 20%</b> — только те, что минимум на 20% дешевле рынка.\n\n"
+            f"Сейчас: <b>{filter_text(current)}</b>",
+            markup(options, [HOME]))
+
+
+def sub_screen(db: FeedDB, user, cfg: dict, owner_ids: set[str]) -> tuple[str, str]:
+    if user["chat_id"] in owner_ids:
+        return "💳 <b>Подписка</b>\n\n👑 Вы владелец бота — доступ без ограничений.", markup([HOME])
+    pending = any(p["status"] == "pending" for p in db.payments_of(user["chat_id"]))
+    text = (f"💳 <b>Подписка</b>\n\n{access_line(user, owner_ids)}\n\n"
+            f"{cfg['payment_text']}\n\n"
+            "<b>Как продлить:</b> переведите оплату, нажмите «📸 Я оплатил» и пришлите скриншот чека.")
+    if pending:
+        text += "\n\n⏳ Ваш чек уже на проверке — обычно это занимает до часа."
+    return text, markup([button("📸 Я оплатил — отправить чек", "u:paid")], [HOME])
+
+
+def help_screen(cfg: dict) -> tuple[str, str]:
+    return (f"❓ <b>Как работает {html.escape(cfg['brand'])}</b>\n\n"
+            "1. Вы присылаете ссылку на поиск OLX со своими фильтрами.\n"
+            "2. Я проверяю его каждые пару минут и присылаю <b>только новые</b> объявления — "
+            "раньше, чем их заметят другие.\n"
+            "3. К каждому объявлению — оценка цены: 🔥 дешевле рынка, ✅ около рынка, "
+            "💸 дороже, ⚠️ подозрительно дёшево (часто это мошенники).\n\n"
+            "<b>Полезное</b>\n"
+            "• ⭐ под объявлением — сохранить в избранное.\n"
+            "• ⏸ под объявлением — поставить поиск на паузу.\n"
+            "• 🎯 Фильтр выгоды — присылать только то, что заметно дешевле рынка.",
+            markup([button("➕ Добавить поиск", "u:add")], [HOME]))
+
+
+# --- Действия пользователя ----------------------------------------------------
+def add_watch(token: str, db: FeedDB, user, text: str, cfg: dict, owner_ids: set[str]) -> None:
+    chat_id = user["chat_id"]
+    retry = markup([button("❓ Как добавить поиск", "u:add")], [HOME])
     if "/obyavlenie/" in text:
-        send(token, chat_id, "Это ссылка на одно объявление. Нужна ссылка на <b>выдачу</b>: "
-                             "откройте категорию с фильтрами и скопируйте адрес страницы со списком.")
+        send(token, chat_id, "🤔 Это ссылка на одно объявление. Нужна ссылка на <b>список</b>: "
+                             "откройте категорию с фильтрами и скопируйте адрес страницы.", reply_markup=retry)
         return
     search_url = normalize_search_url(text)
     if not search_url:
-        send(token, chat_id, "Не похоже на ссылку выдачи OLX.kz. Откройте категорию на olx.kz, "
-                             "выставьте фильтры и пришлите адрес страницы.")
+        send(token, chat_id, "🤔 Не похоже на ссылку поиска OLX.kz.", reply_markup=retry)
         return
     if not is_active(user, owner_ids):
-        send(token, chat_id, status_text(user, cfg, owner_ids))
+        show(token, chat_id, sub_screen(db, user, cfg, owner_ids))
         return
-    count = connection.execute("SELECT COUNT(*) FROM watches WHERE chat_id=?", (chat_id,)).fetchone()[0]
     limit = int(cfg["max_watches"])
-    if chat_id not in owner_ids and count >= limit:
-        send(token, chat_id, f"Можно следить максимум за {limit} поисками. Удалите лишний в /list.")
+    if chat_id not in owner_ids and db.count("watches", chat_id) >= limit:
+        send(token, chat_id, f"📋 Можно следить максимум за {limit} поисками. Удалите ненужный, "
+                             "чтобы добавить новый.", reply_markup=markup([button("📋 Мои поиски", "u:list")], [HOME]))
         return
     title = watch_title(search_url)
-    added = connection.execute(
-        "INSERT OR IGNORE INTO watches(chat_id,search_url,title,created_at) VALUES(?,?,?,?)",
-        (chat_id, search_url, title, int(time.time()))).rowcount
-    connection.commit()
-    if not added:
-        send(token, chat_id, "За этим поиском я уже слежу.")
+    watch_id = db.add_watch(chat_id, search_url, title)
+    if watch_id is None:
+        existing = db.watch_by_url(chat_id, search_url)
+        send(token, chat_id, "👌 За этим поиском я уже слежу.",
+             reply_markup=markup([button("🔍 Открыть поиск", f"u:w:{existing['id']}")], [HOME]))
         return
+    minutes = max(1, int(cfg["poll_seconds"]) // 60)
     send(token, chat_id,
-         f"✅ Слежу: <b>{html.escape(title)}</b>\n\n"
-         "Сначала запомню текущую выдачу, затем буду присылать только новые объявления — "
-         f"обычно в течение {max(1, int(cfg['poll_seconds']) // 60)}–{max(2, int(cfg['poll_seconds']) // 30)} мин. "
-         "после публикации.")
+         f"✅ <b>Слежу:</b> {html.escape(title)}\n\n"
+         f"Сейчас запомню текущие объявления, а дальше буду присылать только новые — "
+         f"примерно через {minutes}–{minutes * 2} мин. после публикации.",
+         reply_markup=markup([button("🔍 Открыть поиск", f"u:w:{watch_id}"), HOME]))
 
 
-def handle_public_update(token: str, connection: sqlite3.Connection, update: dict,
-                         config: dict | None, owner_ids: set[str]) -> bool:
+def handle_receipt(token: str, db: FeedDB, user, chat: dict, message: dict, cfg: dict, owner_ids: set[str]) -> None:
+    """Чек об оплате: в базу как ожидающий, владельцу — с кнопками решения."""
+    photo = (message.get("photo") or [{}])[-1].get("file_id") or (message.get("document") or {}).get("file_id")
+    payment_id = db.create_receipt(user["chat_id"], photo)
+    db.set_user(user["chat_id"], state="", state_data="")
+    name = html.escape(" ".join(filter(None, [chat.get("first_name"), chat.get("last_name")])) or "—")
+    who = f"{name} @{html.escape(chat.get('username') or '—')} (<code>{user['chat_id']}</code>)"
+    for owner in owner_ids:
+        try:
+            w.telegram_request(token, "forwardMessage", chat_id=owner, from_chat_id=user["chat_id"],
+                               message_id=message["message_id"])
+            send(token, owner, f"💳 <b>Чек #{payment_id}</b> от {who}\n{access_line(user, set())}",
+                 reply_markup=markup(
+                     [button(f"✅ +{cfg['period_days']} дн. · {money(int(cfg['price_kzt']))}", f"a:ok:{payment_id}"),
+                      button("❌ Отклонить", f"a:no:{payment_id}")],
+                     [button("👤 Пользователь", f"a:u:{user['chat_id']}")]))
+        except requests.RequestException as error:
+            logging.warning("Не удалось переслать чек владельцу: %s", w.safe_error(error))
+    send(token, user["chat_id"], "✅ <b>Чек получен!</b>\nПроверю и включу доступ — обычно в течение часа. "
+                                 "Я напишу, как только всё будет готово.", reply_markup=markup([HOME]))
+
+
+def handle_user_callback(token: str, db: FeedDB, user, callback: dict, verb: str, arg: str,
+                         cfg: dict, owner_ids: set[str], storage_setting) -> str:
+    """Кнопки пользователя. Возвращает текст всплывающей подсказки."""
+    chat_id, message = user["chat_id"], callback["message"]
+    number = int(arg) if arg.lstrip("-").isdigit() else None
+    if verb == "home":
+        show(token, chat_id, home_screen(db, user, cfg, owner_ids), message)
+    elif verb == "add":
+        show(token, chat_id, add_screen(db, user, cfg, owner_ids), message)
+    elif verb == "list":
+        show(token, chat_id, list_screen(db, user, cfg, owner_ids), message)
+    elif verb in {"w", "wp", "wr", "wd", "wD"}:
+        watch = db.watch(number, chat_id) if number is not None else None
+        if not watch:
+            show(token, chat_id, list_screen(db, user, cfg, owner_ids), message)
+            return "Этот поиск уже удалён"
+        if verb in {"wp", "wr"}:
+            db.set_watch_paused(watch["id"], chat_id, verb == "wp")
+            db.log(chat_id, "watch_pause" if verb == "wp" else "watch_resume", str(watch["id"]))
+            show(token, chat_id, watch_screen(db, db.watch(watch["id"]), cfg), message)
+            return "Поиск на паузе" if verb == "wp" else "Поиск снова работает"
+        if verb == "wd":
+            show(token, chat_id, (f"🗑 Удалить поиск <b>{html.escape(watch['title'])}</b>?\n\n"
+                                  "Уведомления по нему прекратятся. Избранное останется.",
+                                  markup([button("✅ Да, удалить", f"u:wD:{watch['id']}"),
+                                          button("⬅️ Отмена", f"u:w:{watch['id']}")])), message)
+        elif verb == "wD":
+            db.delete_watch(watch["id"], chat_id)
+            show(token, chat_id, list_screen(db, user, cfg, owner_ids), message)
+            return "Поиск удалён"
+        else:
+            show(token, chat_id, watch_screen(db, watch, cfg), message)
+    elif verb == "favs":
+        show(token, chat_id, favorites_screen(db, user), message)
+    elif verb == "fd" and number is not None:
+        db.delete_favorite(number, chat_id)
+        show(token, chat_id, favorites_screen(db, user), message)
+        return "Убрано из избранного"
+    elif verb in {"fav", "np"} and number is not None:
+        # Кнопки под карточкой объявления: перерисовываем только кнопки.
+        delivery = db.delivery(number, chat_id)
+        if not delivery:
+            return "Объявление не найдено"
+        watch = db.watch(delivery["watch_id"], chat_id) if delivery["watch_id"] else None
+        answer = ""
+        if verb == "fav":
+            if db.is_favorite(chat_id, delivery["ad_id"]):
+                db.remove_favorite_ad(chat_id, delivery["ad_id"])
+                answer = "Убрано из избранного"
+            else:
+                db.add_favorite(delivery)
+                answer = "⭐ Сохранено в избранное"
+        elif watch:
+            db.set_watch_paused(watch["id"], chat_id, not watch["paused"])
+            answer = "Поиск снова работает" if watch["paused"] else "Поиск на паузе — нажмите ещё раз, чтобы возобновить"
+            watch = db.watch(watch["id"])
+        else:
+            answer = "Этот поиск уже удалён"
+        w.telegram_request(token, "editMessageReplyMarkup", chat_id=chat_id, message_id=message["message_id"],
+                           reply_markup=card_markup(number, delivery["url"] or "https://www.olx.kz/",
+                                                    db.is_favorite(chat_id, delivery["ad_id"]),
+                                                    bool(watch and watch["paused"])))
+        return answer
+    elif verb == "filter":
+        show(token, chat_id, filter_screen(user), message)
+    elif verb == "f" and number in FILTER_STEPS:
+        if number == user["min_discount"]:
+            return "Уже выбрано"
+        db.set_user(chat_id, min_discount=number)
+        db.log(chat_id, "filter", str(number))
+        show(token, chat_id, filter_screen(db.user(chat_id)), message)
+        return "Сохранено"
+    elif verb == "sub":
+        if user["state"] == "receipt":
+            db.set_user(chat_id, state="")
+        show(token, chat_id, sub_screen(db, user, cfg, owner_ids), message)
+    elif verb == "paid":
+        db.set_user(chat_id, state="receipt")
+        show(token, chat_id, ("📸 <b>Пришлите скриншот или фото чека</b> следующим сообщением.\n\n"
+                              "Я передам его на проверку и напишу, когда доступ будет продлён.",
+                              markup([button("⬅️ Отмена", "u:sub")])), message)
+    elif verb == "help":
+        show(token, chat_id, help_screen(cfg), message)
+    elif verb == "gpu" and chat_id in owner_ids:
+        show(token, chat_id, ("🎮 <b>Видеокарты</b> — панель управления",
+                              json.dumps(w.main_menu(storage_setting), ensure_ascii=False)), message)
+    return ""
+
+
+# --- Админка ----------------------------------------------------------------
+def admin_screen(db: FeedDB, cfg: dict) -> tuple[str, str]:
+    s = db.stats()
+    text = ("👑 <b>Админка</b>\n\n"
+            f"👥 Пользователей: <b>{s['users']}</b> (новых сегодня {s['new_today']}, за 7 дн. {s['new_7d']})\n"
+            f"🟢 Заходили за 7 дн.: {s['active_7d']}\n"
+            f"✅ С доступом: {s['with_access']} — платный {s['paid']}, пробный {s['trial']}\n"
+            f"💰 Платили хоть раз: {s['ever_paid']}\n"
+            f"🚫 Заблокировали бота: {s['blocked']}\n\n"
+            f"📋 Поисков: {s['watches']}, разных выдач в опросе: {s['urls']}\n"
+            f"📨 Отправлено: сегодня {s['sent_today']}, за 7 дн. {s['sent_7d']}\n"
+            f"⭐ В избранном: {s['favorites']}\n\n"
+            f"💵 Выручка за 30 дн.: <b>{money(s['revenue_30d'])}</b> (всего {money(s['revenue_total'])})")
+    return text, markup(
+        [button("👥 Пользователи", "a:ul:0"), button(f"💳 Чеки ({s['pending']})", "a:pay")],
+        [button("📣 Рассылка", "a:bc"), button("🔄 Обновить", "a:home")],
+        [HOME])
+
+
+USERS_PER_PAGE = 8
+
+
+def users_screen(db: FeedDB, page: int) -> tuple[str, str]:
+    total = db.user_count()
+    rows = db.users_page(page * USERS_PER_PAGE, USERS_PER_PAGE)
+    now_ts = time.time()
+    buttons = []
+    for row in rows:
+        mark = "🚫" if row["blocked"] else ("💰" if row["plan"] == "paid" and row["paid_until"] > now_ts
+                                            else "🎁" if row["paid_until"] > now_ts else "⏳")
+        name = f"@{row['username']}" if row["username"] else (row["first_name"] or row["chat_id"])
+        buttons.append([button(f"{mark} {name[:24]} · до {datetime.fromtimestamp(row['paid_until']):%d.%m} · "
+                               f"🔍{row['watches_n']}", f"a:u:{row['chat_id']}")])
+    pages = max(1, math.ceil(total / USERS_PER_PAGE))
+    nav = []
+    if page > 0:
+        nav.append(button("◀️", f"a:ul:{page - 1}"))
+    if page + 1 < pages:
+        nav.append(button("▶️", f"a:ul:{page + 1}"))
+    return (f"👥 <b>Пользователи</b> ({total}) · стр. {page + 1}/{pages}\n\n"
+            "💰 платный · 🎁 пробный · ⏳ истёк · 🚫 заблокировал бота",
+            markup(*buttons, nav, [button("⬅️ Админка", "a:home")]))
+
+
+def user_card(db: FeedDB, chat_id: str, cfg: dict) -> tuple[str, str]:
+    user = db.user(chat_id)
+    if not user:
+        return "Пользователь не найден.", markup([button("⬅️ Пользователи", "a:ul:0")])
+    name = html.escape(" ".join(filter(None, [user["first_name"], user["last_name"]])) or "—")
+    watches = db.watches(chat_id)
+    payments = db.payments_of(chat_id)
+    watch_lines = "\n".join(f"  {'⏸' if row['paused'] else '🟢'} {html.escape(row['title'])} · 📨{row['sent_count']}"
+                            for row in watches) or "  —"
+    payment_lines = "\n".join(
+        f"  {datetime.fromtimestamp(p['created_at']):%d.%m} · {p['method']} · {p['status']} · "
+        f"{p['days']} дн. · {money(p['amount_kzt'])}" for p in payments) or "  —"
+    seen = date_text(user["last_seen_at"]) if user["last_seen_at"] else "—"
+    text = (f"👤 <b>{name}</b> @{html.escape(user['username'] or '—')}\n"
+            f"ID: <code>{chat_id}</code>\n"
+            f"С нами с {date_text(user['joined_at'])}, заходил {seen}\n"
+            f"{access_line(user, set())}" + (" · 🚫 заблокировал бота" if user["blocked"] else "") + "\n"
+            f"🎯 Фильтр: {filter_text(user['min_discount'])}\n"
+            f"⭐ Избранное: {db.count('favorites', chat_id)} · 📨 получено: {db.count('deliveries', chat_id)}\n\n"
+            f"<b>Поиски:</b>\n{watch_lines}\n\n<b>Оплаты:</b>\n{payment_lines}")
+    period, price = int(cfg["period_days"]), int(cfg["price_kzt"])
+    return text, markup(
+        [button(f"💰 +{period} дн. (оплата {money(price)})", f"a:g:{chat_id}:{period}:1")],
+        [button("🎁 +3 дня бонус", f"a:g:{chat_id}:3:0"), button("➖ −1 день", f"a:g:{chat_id}:-1:0")],
+        [button("⬅️ Пользователи", "a:ul:0"), button("👑 Админка", "a:home")])
+
+
+def notify_granted(db: FeedDB, token: str, user) -> None:
+    safe_send(db, token, user["chat_id"],
+              f"✅ <b>Доступ продлён до {date_text(user['paid_until'])}</b>\nСпасибо! Объявления снова приходят.",
+              reply_markup=markup([HOME]))
+
+
+def handle_admin_callback(token: str, db: FeedDB, owner, callback: dict, verb: str, arg: str,
+                          cfg: dict) -> str:
+    chat_id, message = owner["chat_id"], callback["message"]
+    if verb == "home":
+        show(token, chat_id, admin_screen(db, cfg), message)
+    elif verb == "ul":
+        show(token, chat_id, users_screen(db, int(arg) if arg.isdigit() else 0), message)
+    elif verb == "u":
+        show(token, chat_id, user_card(db, arg, cfg), message)
+    elif verb == "g":
+        target, _, rest = arg.partition(":")
+        days, _, paid = rest.partition(":")
+        if not days.lstrip("-").isdigit():
+            return ""
+        days_n = int(days)
+        amount = round(int(cfg["price_kzt"]) * days_n / int(cfg["period_days"])) if paid == "1" else 0
+        user = db.grant(target, days_n, by=chat_id, amount_kzt=amount)
+        if not user:
+            return "Пользователь не найден"
+        if days_n > 0:
+            notify_granted(db, token, user)
+        show(token, chat_id, user_card(db, target, cfg), message)
+        return f"Доступ до {date_text(user['paid_until'])}"
+    elif verb in {"ok", "no"} and arg.isdigit():
+        payment = db.payment(int(arg))
+        if not payment or payment["status"] != "pending":
+            return "Этот чек уже обработан"
+        if verb == "ok":
+            user = db.grant(payment["chat_id"], int(cfg["period_days"]), by=chat_id,
+                            amount_kzt=int(cfg["price_kzt"]), method="receipt", payment_id=payment["id"])
+            notify_granted(db, token, user)
+            result = f"✅ Чек #{payment['id']} подтверждён: доступ до {date_text(user['paid_until'])}"
+        else:
+            db.reject_payment(payment["id"], chat_id)
+            safe_send(db, token, payment["chat_id"],
+                      "❌ <b>Оплата не подтверждена.</b>\nПроверьте сумму и реквизиты и отправьте чек ещё раз.",
+                      reply_markup=markup([button("💳 Подписка", "u:sub")]))
+            result = f"❌ Чек #{payment['id']} отклонён"
+        show(token, chat_id, (result, markup([button("👤 Пользователь", f"a:u:{payment['chat_id']}"),
+                                              button("💳 Чеки", "a:pay")])), message)
+        return "Готово"
+    elif verb == "pay":
+        pending = db.pending_payments()
+        rows = [[button(f"✅ #{p['id']} @{p['username'] or p['first_name'] or p['chat_id']}", f"a:ok:{p['id']}"),
+                 button("❌", f"a:no:{p['id']}"), button("👤", f"a:u:{p['chat_id']}")] for p in pending[:10]]
+        text = ("💳 <b>Чеки на проверке</b>\n\n" + ("Сами чеки — пересланные сообщения выше в чате."
+                                                    if pending else "Нет чеков на проверке. 👌"))
+        show(token, chat_id, (text, markup(*rows, [button("⬅️ Админка", "a:home")])), message)
+    elif verb == "bc":
+        db.set_user(chat_id, state="broadcast", state_data="")
+        show(token, chat_id, (f"📣 <b>Рассылка</b>\n\nПришлите текст следующим сообщением — "
+                              f"получат {len(db.broadcast_targets())} чел. Можно HTML-разметку Telegram.",
+                              markup([button("❌ Отмена", "a:bcx")])), message)
+    elif verb == "bcx":
+        db.set_user(chat_id, state="", state_data="")
+        show(token, chat_id, admin_screen(db, cfg), message)
+        return "Рассылка отменена"
+    elif verb == "bcgo":
+        text = owner["state_data"]
+        db.set_user(chat_id, state="", state_data="")
+        if not text:
+            return "Текст рассылки потерян — начните заново"
+        targets = db.broadcast_targets()
+        delivered = 0
+        for target in targets:
+            delivered += safe_send(db, token, target, text)
+            time.sleep(0.05)  # Telegram ограничивает массовую отправку ~30 сообщениями в секунду
+        db.log(chat_id, "broadcast", f"{delivered}/{len(targets)}")
+        show(token, chat_id, (f"📣 Рассылка завершена: доставлено {delivered} из {len(targets)}.",
+                              markup([button("⬅️ Админка", "a:home")])), message)
+    return ""
+
+
+# --- Вход из Telegram -------------------------------------------------------
+class _Settings:
+    """Кусочек Storage для w.main_menu(): ему нужен только setting()."""
+    def __init__(self, connection) -> None:
+        self.connection = connection
+
+    def setting(self, key: str, default: str = "") -> str:
+        row = self.connection.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return row[0] if row else default
+
+
+def handle_public_update(token: str, connection, update: dict, config: dict | None,
+                         owner_ids: set[str]) -> bool:
     """Обрабатывает то, что относится к публичному режиму. True — обработано.
 
     Команды владельца (/favorites, /search…) для чужих чатов не существуют:
@@ -461,133 +822,124 @@ def handle_public_update(token: str, connection: sqlite3.Connection, update: dic
     cfg = settings(config)
     if not cfg["enabled"]:
         return False
-    ensure_schema(connection)
+    db = FeedDB(connection)
+    trial = int(cfg["trial_days"])
     callback = update.get("callback_query")
     if callback:
-        action, _, payload = callback.get("data", "").partition(":")
-        if action != "f":
+        prefix, _, payload = callback.get("data", "").partition(":")
+        if prefix not in {"f", "u", "a"}:
             return False
-        chat_id = str(callback["message"]["chat"]["id"])
-        verb, _, watch_id = payload.partition(":")
-        if verb == "del" and watch_id.isdigit():
-            removed = connection.execute("DELETE FROM watches WHERE id=? AND chat_id=?",
-                                         (int(watch_id), chat_id)).rowcount
-            connection.commit()
-            w.telegram_request(token, "answerCallbackQuery", callback_query_id=callback["id"],
-                               text="Поиск отключён" if removed else "Этот поиск уже удалён")
-            if callback["message"].get("text", "").startswith("Ваши поиски"):
-                text, keyboard = list_reply(connection, chat_id)
-                w.telegram_request(token, "editMessageText", chat_id=chat_id,
-                                   message_id=callback["message"]["message_id"], text=text,
-                                   parse_mode="HTML", disable_web_page_preview=True,
-                                   reply_markup=json.dumps(keyboard, ensure_ascii=False))
-            else:
-                w.telegram_request(token, "editMessageReplyMarkup", chat_id=chat_id,
-                                   message_id=callback["message"]["message_id"],
-                                   reply_markup=json.dumps({"inline_keyboard": []}))
+        chat = callback["message"]["chat"]
+        user, _ = db.touch_user({**chat, **(callback.get("from") or {}), "id": chat["id"]}, trial)
+        verb, _, arg = payload.partition(":")
+        answer = ""
+        if prefix == "f" and verb == "del" and arg.isdigit():
+            # Кнопка из уведомлений первой версии: «Отключить этот поиск».
+            removed = db.delete_watch(int(arg), user["chat_id"])
+            answer = "Поиск отключён" if removed else "Этот поиск уже удалён"
+            w.telegram_request(token, "editMessageReplyMarkup", chat_id=user["chat_id"],
+                               message_id=callback["message"]["message_id"],
+                               reply_markup=json.dumps({"inline_keyboard": []}))
+        elif prefix == "u":
+            answer = handle_user_callback(token, db, user, callback, verb, arg, cfg, owner_ids,
+                                          _Settings(connection))
+        elif prefix == "a" and user["chat_id"] in owner_ids:
+            answer = handle_admin_callback(token, db, user, callback, verb, arg, cfg)
+        try:
+            w.telegram_request(token, "answerCallbackQuery", callback_query_id=callback["id"], text=answer)
+        except requests.RequestException:
+            pass  # нажатие устарело — подтверждать уже нечего
         return True
+
     message = update.get("message") or {}
     chat = message.get("chat") or {}
     if not chat.get("id"):
         return False
     chat_id = str(chat["id"])
+    is_owner = chat_id in owner_ids
     text = (message.get("text") or message.get("caption") or "").strip()
     command = text.split()[0].split("@", 1)[0].lower() if text.startswith("/") else ""
-    is_owner = chat_id in owner_ids
-    if command == "/start" and not is_owner:
-        user = register_user(connection, chat, int(cfg["trial_days"]))
-        send(token, chat_id, f"👋 Я слежу за OLX и присылаю новые объявления раньше, чем их увидят другие.\n\n"
-                             f"{HELP_TEXT}\n\n🎁 Пробный доступ до <b>{date_text(user['paid_until'])}</b>.")
+    public = {"/start", "/menu", "/help", "/list", "/status", "/discount"}
+    if command and command not in public:
+        # Владелец — к своим командам; посторонний — тишина, даже без записи в базу.
+        return False if is_owner else True
+    user, created = db.touch_user({**chat, **(message.get("from") or {}), "id": chat["id"]}, trial)
+
+    if is_owner and user["state"] in {"broadcast", "broadcast_confirm"} and text and not command:
+        targets = len(db.broadcast_targets())
+        db.set_user(chat_id, state="broadcast_confirm", state_data=message.get("text") or "")
+        send(token, chat_id, f"{message.get('text')}\n\n———\n📣 Отправить это {targets} пользователям?",
+             reply_markup=markup([button("✅ Отправить", "a:bcgo"), button("❌ Отмена", "a:bcx")]))
         return True
-    if command == "/help" and not is_owner:
-        send(token, chat_id, HELP_TEXT)
+    if command in {"/start", "/menu"}:
+        greeting = ""
+        if created and not is_owner:
+            greeting = (f"👋 <b>Привет! Я {html.escape(cfg['brand'])}.</b>\n"
+                        "Присылаю новые объявления с OLX через 1–2 минуты после публикации — раньше, "
+                        "чем их увидят другие, — и показываю, насколько цена ниже рынка.\n")
+        text_, keyboard = home_screen(db, user, cfg, owner_ids, greeting)
+        if created and not is_owner:
+            text_ += f"\n\n🎁 Пробный доступ до <b>{date_text(user['paid_until'])}</b> — начните с первого поиска 👇"
+        send(token, chat_id, text_, reply_markup=keyboard)
         return True
-    if OLX_URL.search(text) and not command:
-        add_watch(token, connection, register_user(connection, chat, int(cfg["trial_days"])),
-                  text, cfg, owner_ids)
+    if command == "/help":
+        show(token, chat_id, help_screen(cfg))
         return True
-    if command in {"/list", "/status", "/discount"}:
-        user = register_user(connection, chat, int(cfg["trial_days"]))
-        if command == "/list":
-            reply, keyboard = list_reply(connection, chat_id)
-            send(token, chat_id, reply, reply_markup=json.dumps(keyboard, ensure_ascii=False))
-        elif command == "/status":
-            send(token, chat_id, status_text(user, cfg, owner_ids))
-        else:
-            argument = text[len("/discount"):].strip().rstrip("%")
-            if not argument.isdigit() or int(argument) > 90:
-                send(token, chat_id, f"Сейчас: <b>{user['min_discount']}%</b>. "
-                                     "Пример: <code>/discount 15</code> — только на 15%+ дешевле рынка, "
-                                     "<code>/discount 0</code> — все новые объявления.")
-            else:
-                connection.execute("UPDATE users SET min_discount=? WHERE chat_id=?", (int(argument), chat_id))
-                connection.commit()
-                send(token, chat_id, "Буду присылать все новые объявления." if argument == "0" else
-                     f"Буду присылать только объявления на {argument}% и больше дешевле рынка.")
+    if command == "/list":
+        show(token, chat_id, list_screen(db, user, cfg, owner_ids))
+        return True
+    if command == "/status":
+        show(token, chat_id, sub_screen(db, user, cfg, owner_ids))
+        return True
+    if command == "/discount":
+        argument = text[len("/discount"):].strip().rstrip("%")
+        if argument.isdigit() and int(argument) <= 90:
+            db.set_user(chat_id, min_discount=int(argument))
+        show(token, chat_id, filter_screen(db.user(chat_id)))
+        return True
+    if OLX_URL.search(text):
+        add_watch(token, db, user, text, cfg, owner_ids)
         return True
     if is_owner:
-        return False  # остальное — обычные команды владельца
+        return False  # остальное — обычные сообщения владельца (заметки и т. п.)
     if message.get("photo") or message.get("document"):
-        # Чек об оплате: пересылаем владельцу с готовой командой продления.
-        for owner in owner_ids:
-            try:
-                w.telegram_request(token, "forwardMessage", chat_id=owner, from_chat_id=chat_id,
-                                   message_id=message["message_id"])
-                send(token, owner, f"От {html.escape(chat.get('first_name') or '')} "
-                                   f"@{html.escape(chat.get('username') or '—')}: "
-                                   f"<code>/grant {chat_id} 30</code>")
-            except requests.RequestException as error:
-                logging.warning("Не удалось переслать чек владельцу: %s", w.safe_error(error))
-        send(token, chat_id, "Спасибо! Передал владельцу — доступ продлят после проверки.")
+        handle_receipt(token, db, user, chat, message, cfg, owner_ids)
         return True
-    if text and not command:
-        send(token, chat_id, "Пришлите ссылку на выдачу OLX — я начну следить за новыми объявлениями. /help")
+    if user["state"] == "receipt":
+        send(token, chat_id, "📸 Нужен скриншот или фото чека — пришлите его картинкой.",
+             reply_markup=markup([button("⬅️ Отмена", "u:sub")]))
         return True
-    return True  # неизвестные и владельческие команды — молча
+    if text:
+        send(token, chat_id, "🤔 Чтобы добавить поиск, пришлите ссылку на выдачу OLX.",
+             reply_markup=markup([button("❓ Как добавить поиск", "u:add")], [HOME]))
+    return True
 
 
 # --- Команды владельца ------------------------------------------------------
-ADMIN_COMMANDS = [
-    {"command": "users", "description": "Пользователи публичного режима"},
-    {"command": "grant", "description": "Продлить доступ: /grant ID 30"},
-]
-
-
-def handle_admin_command(token: str, connection: sqlite3.Connection, message: dict) -> bool:
+def handle_admin_command(token: str, connection, message: dict, config: dict | None = None) -> bool:
     text = (message.get("text") or "").strip()
     command = text.split()[0].split("@", 1)[0].lower() if text.startswith("/") else ""
-    chat_id = message["chat"]["id"]
+    chat_id = str(message["chat"]["id"])
     if command not in {"/grant", "/users"}:
         return False
-    ensure_schema(connection)
-    if command == "/grant":
-        parts = text.split()[1:]
-        if len(parts) != 2 or not parts[1].lstrip("-").isdigit():
-            send(token, chat_id, "Использование: <code>/grant 123456789 30</code> или "
-                                 "<code>/grant @username 30</code> (дни; отрицательное число — убавить).")
-            return True
-        user = grant(connection, parts[0], int(parts[1]))
-        if not user:
-            send(token, chat_id, "Такого пользователя нет — он должен хотя бы раз написать боту /start.")
-            return True
-        send(token, chat_id, f"✅ {html.escape(parts[0])}: доступ до {date_text(user['paid_until'])}")
-        try:
-            send(token, user["chat_id"], f"✅ Доступ продлён до <b>{date_text(user['paid_until'])}</b>. Спасибо!")
-        except requests.RequestException as error:
-            logging.warning("Не удалось уведомить пользователя о продлении: %s", w.safe_error(error))
+    db = FeedDB(connection)
+    cfg = settings(config)
+    if command == "/users":
+        show(token, chat_id, admin_screen(db, cfg))
         return True
-    now = int(time.time())
-    total = connection.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-    active = connection.execute("SELECT COUNT(*) FROM users WHERE paid_until>?", (now,)).fetchone()[0]
-    urls = connection.execute("SELECT COUNT(DISTINCT search_url) FROM watches").fetchone()[0]
-    rows = connection.execute(
-        "SELECT u.*, (SELECT COUNT(*) FROM watches w WHERE w.chat_id=u.chat_id) n "
-        "FROM users u ORDER BY joined_at DESC LIMIT 20").fetchall()
-    lines = [f"<b>Пользователи:</b> {total}, с доступом {active}; разных выдач: {urls}"]
-    for row in rows:
-        mark = "✅" if row["paid_until"] > now else "⏳"
-        blocked = " 🚫" if row["blocked"] else ""
-        lines.append(f"{mark} <code>{row['chat_id']}</code> @{html.escape(row['username'] or '—')} · "
-                     f"до {date_text(row['paid_until'])} · поисков {row['n']}{blocked}")
-    send(token, chat_id, "\n".join(lines))
+    parts = text.split()[1:]
+    if len(parts) != 2 or not parts[1].lstrip("-").isdigit():
+        send(token, chat_id, "Использование: <code>/grant 123456789 30</code> или "
+                             "<code>/grant @username 30</code> (дни; отрицательное число — убавить).\n"
+                             "Удобнее — кнопками: /users → Пользователи.")
+        return True
+    target = db.find_user(parts[0])
+    user = db.grant(target["chat_id"], int(parts[1]), by=chat_id) if target else None
+    if not user:
+        send(token, chat_id, "Такого пользователя нет — он должен хотя бы раз написать боту /start.")
+        return True
+    send(token, chat_id, f"✅ {html.escape(parts[0])}: доступ до {date_text(user['paid_until'])}",
+         reply_markup=markup([button("👤 Карточка", f"a:u:{user['chat_id']}")]))
+    if int(parts[1]) > 0:
+        notify_granted(db, token, user)
     return True

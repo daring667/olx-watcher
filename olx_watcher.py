@@ -628,10 +628,17 @@ class Storage:
 
 def telegram_request(token: str, method: str, **data: object) -> dict:
     response = requests.post(f"https://api.telegram.org/bot{token}/{method}", data=data, timeout=35)
-    response.raise_for_status()
-    result = response.json()
+    # Описание ошибки Telegram отдаёт в теле и при 4xx. raise_for_status() его
+    # терял: «message is not modified» и «bot was blocked by the user»
+    # выглядели одинаково — голым «400/403 Client Error».
+    try:
+        result = response.json()
+    except ValueError:
+        response.raise_for_status()
+        raise
     if not result.get("ok"):
-        raise requests.RequestException(result.get("description", "Ошибка Telegram API"))
+        raise requests.RequestException(
+            f"{response.status_code}: {result.get('description', 'Ошибка Telegram API')}")
     return result
 
 
@@ -978,7 +985,7 @@ def handle_update(token: str, storage: Storage, update: dict, allowed_chat_id: s
     callback = update.get("callback_query")
     if callback:
         action, _, payload = callback.get("data", "").partition(":")
-        if action == "f":
+        if action in {"f", "u", "a"}:
             olx_feed.handle_public_update(token, storage.connection, update, config, owner_ids)
             return
         if action in {"m", "p"}:
@@ -1045,7 +1052,7 @@ def handle_update(token: str, storage: Storage, update: dict, allowed_chat_id: s
         storage.connection.execute("DELETE FROM meta WHERE key=?", (f"pending_note:{chat_id}",)); storage.connection.commit()
         telegram_request(token, "sendMessage", chat_id=chat_id, text="Заметка сохранена.")
         return
-    if olx_feed.handle_admin_command(token, storage.connection, message):
+    if olx_feed.handle_admin_command(token, storage.connection, message, config):
         return
     if olx_feed.handle_public_update(token, storage.connection, update, config, owner_ids):
         return
