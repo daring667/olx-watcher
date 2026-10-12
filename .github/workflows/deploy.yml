@@ -1,4 +1,4 @@
-name: Test and deploy
+name: Tests
 
 on:
   push:
@@ -29,51 +29,3 @@ jobs:
       - name: Run tests
         run: python -m pytest tests/ -q
 
-  deploy:
-    needs: test
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: [self-hosted, droid]
-    steps:
-      - name: Pull latest code
-        run: |
-          cd /home/droid/olx/olx-watcher
-          git fetch origin main
-
-          # `git reset --hard` ниже молча затёр бы правки трекаемых файлов,
-          # сделанные прямо на сервере. Сначала прячем их в stash, чтобы
-          # ничего не пропало бесследно — вернуть можно `git stash list/pop`.
-          if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
-            STASH_LABEL="ci-autostash-$(date -u +%Y%m%d-%H%M%S)"
-            echo "::warning::На сервере есть локальные правки, прячу их как $STASH_LABEL"
-            git status --short --untracked-files=no
-            git stash push -m "$STASH_LABEL"
-          fi
-
-          git reset --hard origin/main
-
-      - name: Install dependencies
-        run: |
-          cd /home/droid/olx/olx-watcher
-          ./venv/bin/pip install -q -r requirements.txt
-
-      - name: Restart services
-        run: |
-          sudo systemctl restart olx-watcher.service
-          sudo systemctl restart olx-dashboard.service
-          sudo systemctl restart olx-mail.service
-
-      - name: Wait for startup
-        run: sleep 5
-
-      - name: Verify services are active
-        run: |
-          sudo systemctl is-active olx-watcher.service
-          sudo systemctl is-active olx-dashboard.service
-          sudo systemctl is-active olx-mail.service
-
-      - name: Verify the dashboard actually answers
-        run: curl -fsS -o /dev/null http://127.0.0.1:5050/
-
-      - name: Show recent logs on failure
-        if: failure()
-        run: sudo journalctl -u olx-watcher.service -n 50 --no-pager

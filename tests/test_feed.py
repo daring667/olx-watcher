@@ -218,3 +218,11 @@ def test_card_price_not_glued_to_title():
 def test_public_commands_match_telegram_rules(entry):
     import re
     assert re.fullmatch(r"[a-z0-9_]{1,32}", entry["command"])
+
+
+def test_payment_text_from_env(monkeypatch):
+    """Реквизиты берутся из .env, чтобы номер Kaspi не лежал в публичном репозитории."""
+    monkeypatch.setenv("FEED_PAYMENT_TEXT", "Kaspi: +7 700\\nПришлите чек")
+    assert olx_feed.settings(CONFIG)["payment_text"] == "Kaspi: +7 700\nПришлите чек"
+    monkeypatch.delenv("FEED_PAYMENT_TEXT")
+    assert "платная" in olx_feed.settings(CONFIG)["payment_text"]

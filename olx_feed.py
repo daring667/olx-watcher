@@ -16,6 +16,7 @@ from __future__ import annotations
 import html
 import json
 import logging
+import os
 import re
 import sqlite3
 import statistics
@@ -74,7 +75,14 @@ HELP_TEXT = (
 
 
 def settings(config: dict | None) -> dict:
-    return {**DEFAULTS, **((config or {}).get("feed") or {})}
+    cfg = {**DEFAULTS, **((config or {}).get("feed") or {})}
+    # Реквизиты — в .env, а не в config.yaml: репозиторий публичный, и номер
+    # Kaspi лежал бы на GitHub. .env построчный, поэтому перенос строки
+    # записывается как \n.
+    payment = os.environ.get("FEED_PAYMENT_TEXT", "").strip()
+    if payment:
+        cfg["payment_text"] = payment.replace("\\n", "\n")
+    return cfg
 
 
 def ensure_schema(connection: sqlite3.Connection) -> None:
