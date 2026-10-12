@@ -142,3 +142,11 @@ def test_api_rate_limit(client):
     codes = [client.call("GET", "me").status_code for _ in range(95)]
     assert codes.count(429) == 5
     assert client.call("GET", "me", user_id=int(OWNER)).status_code == 200  # владельца не ограничиваем
+
+
+def test_exclude_words_via_api(client):
+    r = client.call("POST", "watches", json_body={"query": "iphone 13", "city": "list", "exclude": "чехол, Дисплей"})
+    watch = r.get_json()["watch"]
+    assert watch["exclude"] == "чехол, дисплей"
+    r = client.call("PATCH", f"watches/{watch['id']}", json_body={"exclude": ""})
+    assert r.get_json()["watch"]["exclude"] == ""

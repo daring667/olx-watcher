@@ -121,6 +121,9 @@ nav button .dot { position: absolute; margin-left: 22px; margin-top: -2px; min-w
   background-size: 200% 100%; animation: shimmer 1.2s infinite; }
 @keyframes shimmer { to { background-position: -200% 0; } }
 .paytext { white-space: pre-wrap; margin-top: 10px; }
+.chip { display: inline-block; border: 0; border-radius: 99px; padding: 5px 11px; margin: 0 6px 6px 0; font-size: 13px;
+  background: color-mix(in srgb, var(--accent) 12%, transparent); color: var(--accent); cursor: pointer; }
+.excl { margin-top: 6px; font-size: 13px; color: var(--hint); }
 details summary { cursor: pointer; font-weight: 600; list-style: none; }
 details summary::after { content: " ›"; color: var(--hint); }
 details[open] summary::after { content: " ⌄"; }
@@ -282,6 +285,9 @@ function watchCard(wch) {
       h("label", { class: "switch" }, toggle, h("span"))),
     h("div", { class: "meta" }, "📊 ", wch.median ? h("span", {}, "Рынок: медиана ", h("b", {}, money(wch.median)), " · " + wch.samples + " объявл.")
       : h("span", {}, "Рынок: собираю данные (" + wch.samples + " объявл.)")),
+    wch.exclude ? h("div", { class: "excl" }, "🚫 Исключено: " + wch.exclude) : null,
+    h("div", { class: "actions" },
+      h("button", { class: "btn secondary small", onclick: () => { tap(); push(() => editExclude(wch)); } }, "🚫 Исключения")),
     h("div", { class: "actions" },
       h("button", { class: "btn secondary small", onclick: () => openLink(wch.url) }, "🌐 Открыть на OLX"),
       h("button", { class: "btn danger small", onclick: async () => {
@@ -315,6 +321,10 @@ async function addSearch() {
   const low = h("input", { class: "input", inputmode: "numeric", placeholder: "от" });
   const high = h("input", { class: "input", inputmode: "numeric", placeholder: "до" });
   const link = h("textarea", { class: "input", placeholder: "https://www.olx.kz/…" });
+  const exclude = h("input", { class: "input", placeholder: "чехол, дисплей, запчасти", autocomplete: "off" });
+  const excludeField = h("label", { class: "field" }, h("span", {}, "Не присылать, если в заголовке есть"), exclude,
+    h("div", { style: "margin-top:6px" }, h("button", { class: "chip", type: "button", onclick: e => {
+      e.preventDefault(); tap(); exclude.value = me.accessory_words; } }, "📱 Набор «аксессуары»")));
   const builder = S.addMode === "builder";
   const digits = v => v.value.replace(/\D/g, "");
   [low, high].forEach(i => i.addEventListener("input", () => {
@@ -324,6 +334,7 @@ async function addSearch() {
     const payload = builder
       ? { query: query.value.trim(), city: city.value, price_from: digits(low), price_to: digits(high) }
       : { url: link.value.trim() };
+    payload.exclude = exclude.value;
     if (builder && !payload.query) { haptic("error"); query.focus(); return toast("Напишите, что ищем"); }
     if (!builder && !payload.url) { haptic("error"); link.focus(); return toast("Вставьте ссылку с OLX"); }
     if (tg) tg.MainButton.showProgress();
@@ -340,6 +351,7 @@ async function addSearch() {
       h("label", { class: "field" }, h("span", {}, "Что ищем"), query),
       h("label", { class: "field" }, h("span", {}, "Город"), city),
       h("label", { class: "field" }, h("span", {}, "Цена, ₸"), h("div", { class: "row" }, low, high)),
+      excludeField,
       h("div", { class: "hint", style: "margin:0 4px 12px" }, "💡 Чем точнее запрос, тем точнее оценка «дешевле рынка». Нужны фильтры по категории или состоянию — используйте ссылку с OLX."))
     : h("div", {},
       h("div", { class: "card" },
@@ -349,10 +361,29 @@ async function addSearch() {
           h("li", {}, "Выставьте фильтры: цена, состояние, ключевые слова."),
           h("li", {}, "Скопируйте адрес страницы и вставьте сюда.")),
         h("button", { class: "btn secondary", onclick: () => openLink("https://www.olx.kz/") }, "🌐 Открыть OLX")),
-      h("label", { class: "field" }, h("span", {}, "Ссылка на выдачу"), link)),
+      h("label", { class: "field" }, h("span", {}, "Ссылка на выдачу"), link), excludeField),
     tg ? null : h("button", { class: "btn", onclick: submit }, "Следить за поиском"));
   mainButton("Следить за поиском", submit);
   (builder ? query : link).focus();
+}
+
+async function editExclude(wch) {
+  const me = S.me || await loadMe();
+  const input = h("textarea", { class: "input", placeholder: "чехол, дисплей, запчасти" });
+  input.value = wch.exclude || "";
+  const save = async () => {
+    await run(api("watches/" + wch.id, { method: "PATCH", body: { exclude: input.value } }), "Сохранено");
+    S.stack = []; render();
+  };
+  setView(
+    h("h1", {}, "🚫 Исключения"),
+    h("div", { class: "card" }, h("div", { class: "title clamp" }, wch.title),
+      h("div", { class: "hint", style: "margin-top:6px" }, "Объявления, в заголовке которых есть хоть одно из этих слов, присылать не буду. Через запятую; можно часть слова — «зарядк» отсеет и «зарядка», и «зарядку».")),
+    h("label", { class: "field" }, input),
+    h("div", {}, h("button", { class: "chip", onclick: () => { tap(); input.value = [input.value, me.accessory_words].filter(Boolean).join(", "); } }, "📱 + набор «аксессуары»"),
+      h("button", { class: "chip", onclick: () => { tap(); input.value = ""; } }, "🧹 Очистить")),
+    tg ? null : h("button", { class: "btn", onclick: save }, "Сохранить"));
+  mainButton("Сохранить", save);
 }
 
 // --- Лента и избранное ------------------------------------------------------

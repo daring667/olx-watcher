@@ -143,7 +143,7 @@ def watch_json(row) -> dict:
     enough = median is not None and count >= int(g.cfg["min_samples"])
     return {"id": row["id"], "title": row["title"], "url": row["search_url"], "paused": bool(row["paused"]),
             "sent": row["sent_count"], "last_sent_at": row["last_sent_at"], "created_at": row["created_at"],
-            "median": median if enough else None, "samples": count}
+            "median": median if enough else None, "samples": count, "exclude": row["exclude_words"]}
 
 
 def ad_json(row) -> dict:
@@ -183,6 +183,7 @@ def me():
     return jsonify(
         brand=g.cfg["brand"], user=user_json(user), access=access(user),
         max_watches=None if g.owner else int(g.cfg["max_watches"]),
+        accessory_words=feed.ACCESSORY_WORDS,
         filter_steps=list(feed.FILTER_STEPS), price=int(g.cfg["price_kzt"]),
         period_days=int(g.cfg["period_days"]), payment_text=g.cfg["payment_text"],
         pending_payment=pending, cities=feed.CITIES,
@@ -215,14 +216,21 @@ def add_watch():
     watch_id = g.db.add_watch(user["chat_id"], url, feed.watch_title(url))
     if watch_id is None:
         return error("За этим поиском вы уже следите")
+    if data.get("exclude"):
+        g.db.set_watch_exclude(watch_id, user["chat_id"], str(data["exclude"]))
     return jsonify(watch=watch_json(g.db.watch(watch_id)))
 
 
 @app.patch("/api/watches/<int:watch_id>")
 def update_watch(watch_id: int):
-    if not g.db.set_watch_paused(watch_id, g.user["chat_id"], bool(body().get("paused"))):
+    data, chat_id = body(), g.user["chat_id"]
+    if not g.db.watch(watch_id, chat_id):
         return error("Поиск не найден", 404)
-    g.db.log(g.user["chat_id"], "watch_pause" if body().get("paused") else "watch_resume", str(watch_id))
+    if "paused" in data:
+        g.db.set_watch_paused(watch_id, chat_id, bool(data["paused"]))
+        g.db.log(chat_id, "watch_pause" if data["paused"] else "watch_resume", str(watch_id))
+    if "exclude" in data:
+        g.db.set_watch_exclude(watch_id, chat_id, str(data["exclude"] or ""))
     return jsonify(watch=watch_json(g.db.watch(watch_id)))
 
 

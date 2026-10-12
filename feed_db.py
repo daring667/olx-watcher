@@ -62,6 +62,7 @@ CREATE TABLE IF NOT EXISTS watches (
   paused       INTEGER NOT NULL DEFAULT 0,
   sent_count   INTEGER NOT NULL DEFAULT 0,
   last_sent_at INTEGER,
+  exclude_words TEXT NOT NULL DEFAULT '',     -- через запятую, ищутся в заголовке
   UNIQUE(chat_id, search_url)
 );
 CREATE TABLE IF NOT EXISTS deliveries (
@@ -126,13 +127,30 @@ MIGRATIONS = {
     },
     "watches": {
         "paused": "INTEGER NOT NULL DEFAULT 0", "sent_count": "INTEGER NOT NULL DEFAULT 0",
-        "last_sent_at": "INTEGER",
+        "last_sent_at": "INTEGER", "exclude_words": "TEXT NOT NULL DEFAULT ''",
     },
 }
 
 
 def now() -> int:
     return int(time.time())
+
+
+def normalize_words(words: str) -> str:
+    """«Чехол, стекло;дисплей» → «чехол, стекло, дисплей»: без дублей и пустых."""
+    seen: list[str] = []
+    for word in words.replace(";", ",").replace("\n", ",").split(","):
+        word = " ".join(word.split()).casefold()[:40]
+        if word and word not in seen:
+            seen.append(word)
+    return ", ".join(seen[:30])
+
+
+def is_excluded(title: str, words: str) -> bool:
+    """Ищем только в заголовке: в описании «без чехла» или «стекло целое» —
+    рассказ о самом товаре, и по описанию отсеивались бы нормальные объявления."""
+    low = (title or "").casefold()
+    return any(word in low for word in words.split(", ") if word)
 
 
 def chat_hash(chat_id) -> str:
@@ -312,9 +330,13 @@ class FeedDB:
         return bool(self._write("UPDATE watches SET paused=? WHERE id=? AND chat_id=?",
                                 (int(paused), watch_id, str(chat_id))).rowcount)
 
+    def set_watch_exclude(self, watch_id: int, chat_id, words: str) -> bool:
+        return bool(self._write("UPDATE watches SET exclude_words=? WHERE id=? AND chat_id=?",
+                                (normalize_words(words), watch_id, str(chat_id))).rowcount)
+
     def subscribers(self, search_url: str) -> list[sqlite3.Row]:
         """Подписчики выдачи: поиск не на паузе, бот не заблокирован."""
-        return self._all("SELECT w.id watch_id, u.* FROM watches w JOIN users u ON u.chat_id=w.chat_id "
+        return self._all("SELECT w.id watch_id, w.exclude_words, u.* FROM watches w JOIN users u ON u.chat_id=w.chat_id "
                          "WHERE w.search_url=? AND w.paused=0 AND u.blocked=0", (search_url,))
 
     def polled_urls(self) -> list[str]:

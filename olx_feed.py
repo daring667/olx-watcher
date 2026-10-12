@@ -35,7 +35,7 @@ from curl_cffi import requests as impersonated
 # Через модуль, а не `from … import`: тесты подменяют olx_watcher.telegram_request,
 # и подмена должна действовать и здесь.
 import olx_watcher as w
-from feed_db import DAY, FeedDB
+from feed_db import DAY, FeedDB, is_excluded
 
 DEFAULTS = {
     "enabled": False,
@@ -60,6 +60,8 @@ DEFAULTS = {
 ORDER_KEY, ORDER_VALUE = "search[order]", "created_at:desc"
 OLX_URL = re.compile(r"https?://(?:www\.|m\.)?olx\.kz/[^\s<>\"']+", re.I)
 FILTER_STEPS = (0, 10, 20, 30, 40)
+# Готовый набор для запросов вроде «iphone 13»: OLX отдаёт по нему и дисплеи, и чехлы.
+ACCESSORY_WORDS = "чехол, стекло, плёнка, дисплей, экран, запчасти, корпус, коробка, зарядк, кабель, на запчасти"
 
 # Города для конструктора поиска: адрес OLX → название. Каждый адрес проверен
 # запросом к OLX; «list» — весь Казахстан.
@@ -268,6 +270,8 @@ def poll_url(db: FeedDB, session, token: str, search_url: str, cfg: dict, owner_
         line = market_line(card.price_kzt, median, count, min_samples)
         for user in subscribers:
             if user["min_discount"] > 0 and (pct is None or pct < user["min_discount"]):
+                continue
+            if is_excluded(card.title, user["exclude_words"]):
                 continue
             if send_card(db, token, user, card, line, pct):
                 sent += 1
@@ -536,12 +540,14 @@ def watch_screen(db: FeedDB, watch, cfg: dict) -> tuple[str, str]:
     status = "⏸ на паузе" if watch["paused"] else "🟢 активен"
     toggle = button("▶️ Возобновить", f"u:wr:{watch['id']}") if watch["paused"] \
         else button("⏸ Пауза", f"u:wp:{watch['id']}")
+    excluded = f"\n🚫 Исключено: {html.escape(watch['exclude_words'])}" if watch["exclude_words"] else ""
     return (f"🔍 <b>{html.escape(watch['title'])}</b>\n\n"
             f"Статус: {status}\n📨 Прислано объявлений: {watch['sent_count']}{last}\n"
-            f"📊 Рынок: {market}\n"
+            f"📊 Рынок: {market}{excluded}\n"
             f"📅 Добавлен: {date_text(watch['created_at'])}",
             markup([link("🌐 Открыть выдачу на OLX", watch["search_url"])],
                    [toggle, button("🗑 Удалить", f"u:wd:{watch['id']}")],
+                   [button("🚫 Слова-исключения", f"u:wx:{watch['id']}")],
                    [button("⬅️ Мои поиски", "u:list"), HOME]))
 
 
@@ -680,7 +686,7 @@ def handle_user_callback(token: str, db: FeedDB, user, callback: dict, verb: str
         show(token, chat_id, add_screen(db, user, cfg, owner_ids), message)
     elif verb == "list":
         show(token, chat_id, list_screen(db, user, cfg, owner_ids), message)
-    elif verb in {"w", "wp", "wr", "wd", "wD"}:
+    elif verb in {"w", "wp", "wr", "wd", "wD", "wx", "wxa", "wxc"}:
         watch = db.watch(number, chat_id) if number is not None else None
         if not watch:
             show(token, chat_id, list_screen(db, user, cfg, owner_ids), message)
@@ -690,6 +696,23 @@ def handle_user_callback(token: str, db: FeedDB, user, callback: dict, verb: str
             db.log(chat_id, "watch_pause" if verb == "wp" else "watch_resume", str(watch["id"]))
             show(token, chat_id, watch_screen(db, db.watch(watch["id"]), cfg), message)
             return "Поиск на паузе" if verb == "wp" else "Поиск снова работает"
+        if verb == "wx":
+            db.set_user(chat_id, state=f"exclude:{watch['id']}")
+            current = watch["exclude_words"] or "нет"
+            show(token, chat_id, ("🚫 <b>Слова-исключения</b>\n\n"
+                                  "Объявления, в заголовке которых есть эти слова, присылать не буду. "
+                                  "Пришлите слова через запятую следующим сообщением.\n\n"
+                                  f"Сейчас: <i>{html.escape(current)}</i>",
+                                  markup([button("📱 Набор «аксессуары»", f"u:wxa:{watch['id']}")],
+                                         [button("🧹 Очистить", f"u:wxc:{watch['id']}"),
+                                          button("⬅️ Назад", f"u:w:{watch['id']}")])), message)
+            return ""
+        if verb in {"wxa", "wxc"}:
+            words = "" if verb == "wxc" else ", ".join(filter(None, [watch["exclude_words"], ACCESSORY_WORDS]))
+            db.set_watch_exclude(watch["id"], chat_id, words)
+            db.set_user(chat_id, state="")
+            show(token, chat_id, watch_screen(db, db.watch(watch["id"]), cfg), message)
+            return "Исключения очищены" if verb == "wxc" else "Добавлен набор «аксессуары»"
         if verb == "wd":
             show(token, chat_id, (f"🗑 Удалить поиск <b>{html.escape(watch['title'])}</b>?\n\n"
                                   "Уведомления по нему прекратятся. Избранное останется.",
@@ -1031,6 +1054,14 @@ def handle_public_update(token: str, connection, update: dict, config: dict | No
             db.set_user(chat_id, min_discount=int(argument))
         show(token, chat_id, filter_screen(db.user(chat_id)))
         return True
+    if user["state"].startswith("exclude:") and text and not command:
+        watch_id = user["state"].split(":", 1)[1]
+        db.set_user(chat_id, state="")
+        watch = db.watch(int(watch_id), chat_id) if watch_id.isdigit() else None
+        if watch:
+            db.set_watch_exclude(watch["id"], chat_id, text)
+            show(token, chat_id, watch_screen(db, db.watch(watch["id"]), cfg))
+            return True
     if OLX_URL.search(text):
         add_watch(token, db, user, text, cfg, owner_ids)
         return True

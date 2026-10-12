@@ -568,3 +568,40 @@ def test_healthcheck_alert_is_escaped_and_marked_only_when_sent(tmp_path, monkey
     healthcheck.main()
     assert "&lt;urlopen error&gt;" in sent[0]["text"]
     assert healthcheck.meta(connection, "monitor_alert_at") != ""
+
+
+# --- Слова-исключения ---------------------------------------------------------
+def test_exclude_words_normalized_and_matched_in_title_only():
+    from feed_db import is_excluded, normalize_words
+    words = normalize_words("Чехол;  стекло\nДисплей, чехол,,")
+    assert words == "чехол, стекло, дисплей"
+    assert is_excluded("Дисплей на айфон 13", words)
+    assert not is_excluded("iPhone 13 128GB", words)
+    assert not is_excluded("iPhone 13", "")
+
+
+def test_excluded_cards_are_not_sent(bot, monkeypatch):
+    storage, db, calls = bot
+    url, pages, cfg = poll_setup(storage, db, monkeypatch)
+    db.set_watch_exclude(db.watches("777")[0]["id"], "777", "дисплей")
+    olx_feed.poll_url(db, None, "token", url, cfg, {OWNER})
+    calls.clear()
+    pages.append(pages[0] + [olx_watcher.Listing("NEW1", "u", "Дисплей на айфон 13", 20000),
+                             olx_watcher.Listing("NEW2", "u", "iPhone 13 128GB", 70000)])
+    olx_feed.poll_url(db, None, "token", url, cfg, {OWNER})
+    to_777 = [kw["text"] for method, kw in calls if method == "sendMessage" and kw["chat_id"] == "777"]
+    assert len(to_777) == 1 and "iPhone 13 128GB" in to_777[0]
+
+
+def test_exclude_words_via_bot(bot):
+    storage, db, calls = bot
+    say(storage, 777, SEARCH)
+    watch_id = db.watches("777")[0]["id"]
+    press(storage, 777, f"u:wx:{watch_id}")
+    say(storage, 777, "Чехол, стекло")
+    assert db.watch(watch_id)["exclude_words"] == "чехол, стекло"
+    assert "Исключено: чехол, стекло" in texts(calls)[-1]
+    press(storage, 777, f"u:wxa:{watch_id}")
+    assert "дисплей" in db.watch(watch_id)["exclude_words"]
+    press(storage, 777, f"u:wxc:{watch_id}")
+    assert db.watch(watch_id)["exclude_words"] == ""
