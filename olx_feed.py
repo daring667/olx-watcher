@@ -49,6 +49,8 @@ DEFAULTS = {
     "window_days": 30,
     "price_kzt": 5000,
     "period_days": 30,
+    # Цена той же подписки в Telegram Stars; 0 — оплаты звёздами нет.
+    "price_stars": 100,
     "proxy": "",
     # HTTPS-адрес Mini App. Пустой — кнопки приложения в боте нет.
     "miniapp_url": "",
@@ -624,16 +626,91 @@ def filter_screen(user) -> tuple[str, str]:
             markup(options, [HOME]))
 
 
+# --- Telegram Stars -----------------------------------------------------------
+def invoice_params(chat_id, cfg: dict) -> dict:
+    stars, period = int(cfg["price_stars"]), int(cfg["period_days"])
+    return {"title": f"Подписка на {period} дней",
+            "description": f"{cfg['brand']}: новые объявления OLX через 1–2 минуты и оценка цены. "
+                           f"Доступ продлится на {period} дней.",
+            "payload": f"sub:{chat_id}:{period}:{stars}", "currency": "XTR", "provider_token": "",
+            "prices": json.dumps([{"label": f"Подписка {period} дней", "amount": stars}])}
+
+
+def send_invoice(token: str, chat_id, cfg: dict) -> None:
+    w.telegram_request(token, "sendInvoice", chat_id=chat_id, **invoice_params(chat_id, cfg))
+
+
+def invoice_link(token: str, chat_id, cfg: dict) -> str:
+    return w.telegram_request(token, "createInvoiceLink", **invoice_params(chat_id, cfg))["result"]
+
+
+def parse_payload(payload: str) -> tuple[str, int, int] | None:
+    parts = (payload or "").split(":")
+    if len(parts) != 4 or parts[0] != "sub" or not all(p.lstrip("-").isdigit() for p in parts[1:]):
+        return None
+    return parts[1], int(parts[2]), int(parts[3])
+
+
+def handle_payment_update(token: str, connection, update: dict, config: dict | None,
+                          owner_ids: set[str]) -> bool:
+    """pre_checkout_query и successful_payment. True — это был платёж, и он обработан."""
+    cfg = settings(config)
+    query = update.get("pre_checkout_query")
+    message = update.get("message") or {}
+    payment = message.get("successful_payment")
+    if not query and not payment:
+        return False
+    db = FeedDB(connection)
+    if query:
+        parsed = parse_payload(query.get("invoice_payload", ""))
+        error = ""
+        if not cfg["enabled"] or not int(cfg["price_stars"]):
+            error = "Оплата сейчас недоступна"
+        elif (not parsed or parsed[0] != str(query["from"]["id"]) or query.get("currency") != "XTR"
+              or query.get("total_amount") != int(cfg["price_stars"]) or parsed[1] != int(cfg["period_days"])):
+            # Счёт старый (цена поменялась) или чужой — пусть запросит новый.
+            error = "Счёт устарел — откройте «Подписка» и оплатите заново"
+        elif not db.user(parsed[0]):
+            error = "Сначала запустите бота командой /start"
+        extra = {"error_message": error} if error else {}
+        w.telegram_request(token, "answerPreCheckoutQuery", pre_checkout_query_id=query["id"],
+                           ok="false" if error else "true", **extra)
+        return True
+    parsed = parse_payload(payment.get("invoice_payload", ""))
+    charge = payment.get("telegram_payment_charge_id", "")
+    chat_id = str(message["chat"]["id"])
+    if not parsed or parsed[0] != chat_id or db.payment_by_reference(charge):
+        logging.warning("Stars: пропущен платёж %s от %s", charge, chat_id)
+        return True  # повтор или чужой payload — второй раз не зачисляем
+    user = db.grant(chat_id, parsed[1], by="stars", amount_kzt=int(cfg["price_kzt"]),
+                    method="stars", reference=charge)
+    db.log(chat_id, "stars_paid", f"{payment.get('total_amount')} XTR")
+    notify_granted(db, token, user)
+    who = f"@{user['username']}" if user["username"] else user["first_name"] or chat_id
+    notify_owners(db, token, owner_ids, f"⭐ <b>Оплата Stars</b>: {html.escape(str(who))} — "
+                                        f"{payment.get('total_amount')} ⭐, доступ до {date_text(user['paid_until'])}\n"
+                                        f"Возврат: <code>/refund {html.escape(charge)}</code>")
+    return True
+
+
 def sub_screen(db: FeedDB, user, cfg: dict, owner_ids: set[str]) -> tuple[str, str]:
     if user["chat_id"] in owner_ids:
-        return "💳 <b>Подписка</b>\n\n👑 Вы владелец бота — доступ без ограничений.", markup([HOME])
+        rows = [[button(f"⭐ Тест оплаты: {cfg['price_stars']} Stars", "u:stars")]] if int(cfg["price_stars"]) else []
+        return ("💳 <b>Подписка</b>\n\n👑 Вы владелец бота — доступ без ограничений.\n"
+                "Кнопка ниже — проверить, как проходит оплата звёздами (вернуть: /refund).",
+                markup(*rows, [HOME]))
     pending = any(p["status"] == "pending" for p in db.payments_of(user["chat_id"]))
     text = (f"💳 <b>Подписка</b>\n\n{access_line(user, owner_ids)}\n\n"
             f"{cfg['payment_text']}\n\n"
             "<b>Как продлить:</b> переведите оплату, нажмите «📸 Я оплатил» и пришлите скриншот чека.")
     if pending:
         text += "\n\n⏳ Ваш чек уже на проверке — обычно это занимает до часа."
-    return text, markup([button("📸 Я оплатил — отправить чек", "u:paid")], [HOME])
+    rows = []
+    if int(cfg["price_stars"]):
+        text += (f"\n\n⭐ Или мгновенно звёздами Telegram — {cfg['price_stars']} ⭐, "
+                 "доступ продлится сразу после оплаты.")
+        rows.append([button(f"⭐ Оплатить {cfg['price_stars']} Stars", "u:stars")])
+    return text, markup(*rows, [button("📸 Я оплатил по Kaspi — отправить чек", "u:paid")], [HOME])
 
 
 def delete_screen() -> tuple[str, str]:
@@ -822,6 +899,9 @@ def handle_user_callback(token: str, db: FeedDB, user, callback: dict, verb: str
                               markup([button("⬅️ Отмена", "u:sub")])), message)
     elif verb == "help":
         show(token, chat_id, help_screen(cfg), message)
+    elif verb == "stars" and int(cfg["price_stars"]):
+        send_invoice(token, chat_id, cfg)
+        return "Счёт отправлен — оплатите его ниже"
     elif verb == "ref":
         show(token, chat_id, invite_screen(db, token, user), message)
     elif verb == "del":
@@ -1182,12 +1262,29 @@ def handle_admin_command(token: str, connection, message: dict, config: dict | N
     text = (message.get("text") or "").strip()
     command = text.split()[0].split("@", 1)[0].lower() if text.startswith("/") else ""
     chat_id = str(message["chat"]["id"])
-    if command not in {"/grant", "/users"}:
+    if command not in {"/grant", "/users", "/refund"}:
         return False
     db = FeedDB(connection)
     cfg = settings(config)
     if command == "/users":
         show(token, chat_id, admin_screen(db, cfg))
+        return True
+    if command == "/refund":
+        charge = text.split()[1] if len(text.split()) == 2 else ""
+        payment = db.payment_by_reference(charge) if charge else None
+        if not payment or payment["status"] != "approved":
+            send(token, chat_id, "Использование: <code>/refund ID_платежа</code> — ID есть в сообщении "
+                                 "«⭐ Оплата Stars» и в карточке пользователя.")
+            return True
+        try:
+            w.telegram_request(token, "refundStarPayment", user_id=payment["chat_id"],
+                               telegram_payment_charge_id=charge)
+        except requests.RequestException as error:
+            send(token, chat_id, f"Telegram не вернул оплату: {html.escape(str(error))}")
+            return True
+        db.mark_refunded(payment["id"])
+        db.grant(payment["chat_id"], -payment["days"], by=chat_id)
+        send(token, chat_id, f"↩️ Оплата возвращена, доступ уменьшен на {payment['days']} дн.")
         return True
     parts = text.split()[1:]
     if len(parts) != 2 or not parts[1].lstrip("-").isdigit():

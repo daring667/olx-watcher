@@ -189,6 +189,7 @@ def me():
         accessory_words=feed.ACCESSORY_WORDS,
         filter_steps=list(feed.FILTER_STEPS), price=int(g.cfg["price_kzt"]),
         period_days=int(g.cfg["period_days"]), payment_text=g.cfg["payment_text"],
+        price_stars=int(g.cfg["price_stars"]),
         pending_payment=pending, cities=feed.CITIES,
         watches=[watch_json(row) for row in db.watches(user["chat_id"])],
         favorites_count=db.count("favorites", user["chat_id"]),
@@ -290,6 +291,18 @@ def delete_me():
     """«Удалить мои данные» из профиля приложения."""
     g.db.delete_user(g.user["chat_id"])
     return jsonify(ok=True)
+
+
+@app.post("/api/invoice")
+def invoice():
+    """Ссылка на счёт в Stars — приложение открывает его через tg.openInvoice."""
+    if not int(g.cfg["price_stars"]):
+        return error("Оплата звёздами выключена")
+    try:
+        return jsonify(link=feed.invoice_link(g.token, g.user["chat_id"], g.cfg))
+    except Exception:
+        logging.exception("createInvoiceLink")
+        return error("Не удалось создать счёт — попробуйте ещё раз", 502)
 
 
 @app.post("/api/paid")

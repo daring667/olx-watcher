@@ -251,7 +251,8 @@ class FeedDB:
         return self.user(target)
 
     def grant(self, chat_id, days: int, by: str = "", amount_kzt: int = 0,
-              method: str = "manual", payment_id: int | None = None) -> sqlite3.Row | None:
+              method: str = "manual", payment_id: int | None = None,
+              reference: str | None = None) -> sqlite3.Row | None:
         """Продлевает доступ от более поздней из дат: сейчас или текущий конец.
 
         Каждое продление — строка в payments: по ним считается выручка и
@@ -271,9 +272,9 @@ class FeedDB:
             self.c.execute("UPDATE payments SET status='approved', days=?, amount_kzt=?, decided_at=?, "
                            "decided_by=? WHERE id=?", (days, amount_kzt, now(), by, payment_id))
         else:
-            self.c.execute("INSERT INTO payments(chat_id,days,amount_kzt,method,status,created_at,"
-                           "decided_at,decided_by) VALUES(?,?,?,?, 'approved', ?,?,?)",
-                           (user["chat_id"], days, amount_kzt, method, now(), now(), by))
+            self.c.execute("INSERT INTO payments(chat_id,days,amount_kzt,method,status,receipt_file,created_at,"
+                           "decided_at,decided_by) VALUES(?,?,?,?, 'approved', ?,?,?,?)",
+                           (user["chat_id"], days, amount_kzt, method, reference, now(), now(), by))
         self.c.commit()
         self.log(user["chat_id"], "grant", f"{days} дн.")
         referrer = self.user(user["referrer"]) if first_payment and user["referrer"] else None
@@ -495,6 +496,13 @@ class FeedDB:
                              "VALUES(?, 'receipt', 'pending', ?, ?)", (str(chat_id), file_id, now()))
         self.log(chat_id, "receipt")
         return cursor.lastrowid
+
+    def payment_by_reference(self, reference: str) -> sqlite3.Row | None:
+        """Платёж Stars по telegram_payment_charge_id: защита от двойного зачисления."""
+        return self._one("SELECT * FROM payments WHERE receipt_file=? AND method='stars'", (reference,))
+
+    def mark_refunded(self, payment_id: int) -> None:
+        self._write("UPDATE payments SET status='refunded', decided_at=? WHERE id=?", (now(), payment_id))
 
     def payment(self, payment_id: int) -> sqlite3.Row | None:
         return self._one("SELECT * FROM payments WHERE id=?", (payment_id,))

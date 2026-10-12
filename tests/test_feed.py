@@ -215,7 +215,8 @@ def test_expired_user_is_sent_to_subscription(bot):
     db.set_user("777", paid_until=int(time.time()) - 1)
     say(storage, 777, SEARCH)
     assert "Доступ закончился" in texts(calls)[-1]
-    assert "📸 Я оплатил — отправить чек" in buttons(calls)
+    assert "📸 Я оплатил по Kaspi — отправить чек" in buttons(calls)
+    assert "⭐ Оплатить 100 Stars" in buttons(calls)
     assert db.watches("777") == []
 
 
@@ -694,3 +695,68 @@ def test_invite_screen(bot, monkeypatch):
     press(storage, 777, "u:ref")
     assert "https://t.me/radar_bot?start=ref_777" in texts(calls)[-1]
     assert buttons(calls)["📤 Поделиться ссылкой"].startswith("https://t.me/share/url?url=")
+
+
+# --- Telegram Stars -----------------------------------------------------------
+def pre_checkout(storage, user_id, payload, amount=100, currency="XTR"):
+    update = {"update_id": 5, "pre_checkout_query": {"id": "q1", "from": {"id": user_id}, "currency": currency,
+                                                      "total_amount": amount, "invoice_payload": payload}}
+    olx_watcher.handle_update("token", storage, update, OWNER, CONFIG)
+
+
+def paid(storage, user_id, payload, charge="ch1"):
+    message = {"message_id": 3, "chat": {"id": user_id}, "from": {"id": user_id},
+               "successful_payment": {"currency": "XTR", "total_amount": 100, "invoice_payload": payload,
+                                      "telegram_payment_charge_id": charge}}
+    olx_watcher.handle_update("token", storage, {"update_id": 6, "message": message}, OWNER, CONFIG)
+
+
+def last_precheckout(calls):
+    return [kw for method, kw in calls if method == "answerPreCheckoutQuery"][-1]
+
+
+def test_stars_invoice_button(bot):
+    storage, _, calls = bot
+    say(storage, 777, "/start")
+    press(storage, 777, "u:stars")
+    invoice = [kw for method, kw in calls if method == "sendInvoice"][0]
+    assert invoice["currency"] == "XTR" and invoice["provider_token"] == ""
+    assert json.loads(invoice["prices"])[0]["amount"] == 100
+    assert invoice["payload"] == "sub:777:30:100"
+
+
+@pytest.mark.parametrize("user_id, payload, amount, ok", [
+    (777, "sub:777:30:100", 100, "true"),
+    (777, "sub:888:30:100", 100, "false"),     # чужой счёт
+    (777, "sub:777:30:100", 50, "false"),      # цена поменялась
+    (777, "мусор", 100, "false"),
+])
+def test_pre_checkout_validation(bot, user_id, payload, amount, ok):
+    storage, _, calls = bot
+    say(storage, 777, "/start")
+    pre_checkout(storage, user_id, payload, amount)
+    assert last_precheckout(calls)["ok"] == ok
+
+
+def test_successful_payment_extends_once(bot):
+    storage, db, calls = bot
+    say(storage, 777, "/start")
+    before = db.user("777")["paid_until"]
+    paid(storage, 777, "sub:777:30:100")
+    paid(storage, 777, "sub:777:30:100")        # Telegram прислал повторно
+    user = db.user("777")
+    assert user["paid_until"] - before == 30 * DAY and user["plan"] == "paid"
+    assert db.payment_by_reference("ch1")["method"] == "stars"
+    assert any("Оплата Stars" in t for t in texts(calls))  # владельцу
+    assert any("Доступ продлён" in t for t in texts(calls))
+
+
+def test_refund_command(bot):
+    storage, db, calls = bot
+    say(storage, 777, "/start")
+    paid(storage, 777, "sub:777:30:100", charge="ch9")
+    paid_until = db.user("777")["paid_until"]
+    say(storage, OWNER, "/refund ch9")
+    assert any(method == "refundStarPayment" for method, _ in calls)
+    assert db.payment_by_reference("ch9")["status"] == "refunded"
+    assert paid_until - db.user("777")["paid_until"] == 30 * DAY

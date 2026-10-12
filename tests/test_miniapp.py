@@ -150,3 +150,10 @@ def test_exclude_words_via_api(client):
     assert watch["exclude"] == "чехол, дисплей"
     r = client.call("PATCH", f"watches/{watch['id']}", json_body={"exclude": ""})
     assert r.get_json()["watch"]["exclude"] == ""
+
+
+def test_invoice_link(client, monkeypatch):
+    monkeypatch.setattr(olx_watcher, "telegram_request",
+                        lambda token, method, **kw: {"result": "https://t.me/$invoice"} if method == "createInvoiceLink" else {"result": {}})
+    r = client.call("POST", "invoice")
+    assert r.get_json()["link"] == "https://t.me/$invoice"

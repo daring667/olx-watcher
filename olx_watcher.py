@@ -984,6 +984,10 @@ def handle_update(token: str, storage: Storage, update: dict, allowed_chat_id: s
     # Посторонним доступен лишь публичный режим (свои поиски по ссылкам),
     # и то если он включён в config.yaml.
     owner_ids = {cid.strip() for cid in str(allowed_chat_id).split(",")}
+    # Оплата Stars: pre_checkout_query приходит без чата, поэтому разбираем его
+    # раньше проверки отправителя, иначе он ушёл бы в ветку владельца.
+    if olx_feed.handle_payment_update(token, storage.connection, update, config, owner_ids):
+        return
     sender = update_chat_id(update)
     if sender and sender not in owner_ids:
         if not olx_feed.handle_public_update(token, storage.connection, update, config, owner_ids):
@@ -1109,7 +1113,7 @@ def telegram_listener(token: str, chat_id: str, stop: threading.Event, config: d
                 offset = storage.get_offset()
                 response = requests.get(
                     f"https://api.telegram.org/bot{token}/getUpdates",
-                    params={"offset": offset, "timeout": 25, "allowed_updates": json.dumps(["message", "callback_query"])}, timeout=35,
+                    params={"offset": offset, "timeout": 25, "allowed_updates": json.dumps(["message", "callback_query", "pre_checkout_query"])}, timeout=35,
                 )
                 response.raise_for_status()
                 for update in response.json().get("result", []):

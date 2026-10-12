@@ -462,11 +462,19 @@ async function profile() {
       a.active ? h("div", { class: "progress" }, h("i", { style: "width:" + pct + "%" })) : null,
       h("div", { class: "paytext", html: me.payment_text.replace(/\n/g, "<br>") }),
       me.pending_payment ? h("div", { class: "banner ok", style: "margin:12px 0 0" }, "⏳ Ваш чек на проверке — обычно до часа.") : null,
-      h("div", { class: "actions" }, h("button", { class: "btn", onclick: async () => {
+      me.price_stars ? h("div", { class: "actions" }, h("button", { class: "btn", onclick: async () => {
+        const { link } = await run(api("invoice", { method: "POST" }));
+        const done = status => {
+          if (status === "paid") { haptic("success"); toast("✅ Оплачено! Доступ продлён"); setTimeout(render, 1500); }
+          else if (status === "failed") { haptic("error"); toast("Оплата не прошла"); }
+        };
+        tg && tg.openInvoice ? tg.openInvoice(link, done) : openLink(link);
+      } }, "⭐ Оплатить " + me.price_stars + " Stars — сразу")) : null,
+      h("div", { class: "actions" }, h("button", { class: "btn secondary", onclick: async () => {
         await run(api("paid", { method: "POST" }));
         const done = () => tg ? tg.close() : null;
         tg && tg.showAlert ? tg.showAlert("Пришлите скриншот чека в чат с ботом — я уже написал вам там.", done) : done();
-      } }, "📸 Я оплатил — отправить чек"))),
+      } }, "📸 Оплатил по Kaspi — отправить чек"))),
     me.referral.link ? h("div", {},
       h("h2", {}, "Пригласи друга"),
       h("div", { class: "card" },
