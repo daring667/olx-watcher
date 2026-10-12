@@ -657,3 +657,40 @@ def test_removed_favorite_is_marked(bot, monkeypatch):
     assert "Снято с публикации" in texts(calls)[-1]
     press(storage, 777, "u:favs")
     assert "снято" in texts(calls)[-1]
+
+
+# --- Рефералы -----------------------------------------------------------------
+def test_referral_reward_only_on_first_payment(bot, monkeypatch):
+    storage, db, calls = bot
+    monkeypatch.setattr(olx_feed, "_bot_username", {"token": "radar_bot"})
+    say(storage, 777, "/start")
+    say(storage, 888, "/start ref_777")
+    assert db.user("888")["referrer"] == "777"
+    before = db.user("777")["paid_until"]
+    press(storage, OWNER, "a:g:888:3:0")                      # бонус — не оплата
+    assert db.user("777")["paid_until"] == before
+    press(storage, OWNER, "a:g:888:30:1")                     # первая оплата
+    assert db.user("777")["paid_until"] - before == 7 * DAY
+    assert any("друг оформил подписку" in t for t in texts(calls))
+    press(storage, OWNER, "a:g:888:30:1")                     # вторая — без награды
+    assert db.user("777")["paid_until"] - before == 7 * DAY
+    assert db.referral_stats("777") == (1, 1)
+
+
+def test_referral_rules(bot):
+    storage, db, _ = bot
+    say(storage, 777, "/start ref_777")                      # сам себя
+    assert db.user("777")["referrer"] is None
+    say(storage, 888, "/start ref_999")                      # несуществующий
+    assert db.user("888")["referrer"] is None
+    say(storage, 888, "/start ref_777")                      # уже зарегистрирован
+    assert db.user("888")["referrer"] is None
+
+
+def test_invite_screen(bot, monkeypatch):
+    storage, _, calls = bot
+    monkeypatch.setattr(olx_feed, "_bot_username", {"token": "radar_bot"})
+    say(storage, 777, "/start")
+    press(storage, 777, "u:ref")
+    assert "https://t.me/radar_bot?start=ref_777" in texts(calls)[-1]
+    assert buttons(calls)["📤 Поделиться ссылкой"].startswith("https://t.me/share/url?url=")

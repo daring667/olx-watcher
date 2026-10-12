@@ -20,6 +20,7 @@ import statistics
 import time
 
 DAY = 86400
+REFERRAL_DAYS = 7  # столько дней получает пригласивший, когда друг впервые оплатил
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -39,7 +40,8 @@ CREATE TABLE IF NOT EXISTS users (
   expired_notified   INTEGER NOT NULL DEFAULT 0,         -- «закончился»
   state              TEXT NOT NULL DEFAULT '',           -- ожидаемый ввод: receipt, broadcast
   state_data         TEXT NOT NULL DEFAULT '',
-  admin_note         TEXT NOT NULL DEFAULT ''
+  admin_note         TEXT NOT NULL DEFAULT '',
+  referrer           TEXT                                -- кто пригласил (chat_id)
 );
 CREATE TABLE IF NOT EXISTS payments (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -126,7 +128,7 @@ MIGRATIONS = {
         "broadcast_opt_out": "INTEGER NOT NULL DEFAULT 0",
         "expiring_notified": "INTEGER NOT NULL DEFAULT 0",
         "state": "TEXT NOT NULL DEFAULT ''", "state_data": "TEXT NOT NULL DEFAULT ''",
-        "admin_note": "TEXT NOT NULL DEFAULT ''",
+        "admin_note": "TEXT NOT NULL DEFAULT ''", "referrer": "TEXT",
     },
     "favorites": {
         "current_price": "INTEGER", "checked_at": "INTEGER", "gone": "INTEGER NOT NULL DEFAULT 0",
@@ -166,6 +168,9 @@ def chat_hash(chat_id) -> str:
 class FeedDB:
     def __init__(self, connection: sqlite3.Connection) -> None:
         self.c = connection
+        # chat_id пригласившего, если последний grant() наградил его за друга:
+        # уведомление отправляет вызывающий код (notify_granted), у базы нет токена.
+        self.referral_reward: str | None = None
         self.c.row_factory = sqlite3.Row
         self.c.execute("PRAGMA busy_timeout=5000")
         self.c.executescript(SCHEMA)
@@ -255,6 +260,9 @@ class FeedDB:
         user = self.user(chat_id)
         if not user:
             return None
+        self.referral_reward = None
+        first_payment = amount_kzt > 0 and not self._one(
+            "SELECT 1 FROM payments WHERE chat_id=? AND status='approved' AND amount_kzt>0", (user["chat_id"],))
         until = max(now(), user["paid_until"]) + days * DAY
         self.c.execute("UPDATE users SET paid_until=?, plan=CASE WHEN ?>0 THEN 'paid' ELSE plan END, "
                        "expired_notified=0, expiring_notified=0 WHERE chat_id=?",
@@ -268,7 +276,32 @@ class FeedDB:
                            (user["chat_id"], days, amount_kzt, method, now(), now(), by))
         self.c.commit()
         self.log(user["chat_id"], "grant", f"{days} дн.")
+        referrer = self.user(user["referrer"]) if first_payment and user["referrer"] else None
+        if referrer:
+            # Награда — за первую оплату друга, а не за регистрацию: иначе бонусы
+            # набивались бы фейковыми аккаунтами.
+            self.grant(referrer["chat_id"], REFERRAL_DAYS, by="referral", method="referral")
+            self.log(referrer["chat_id"], "referral_reward", user["chat_id"])
+            self.referral_reward = referrer["chat_id"]
         return self.user(user["chat_id"])
+
+    def set_referrer(self, chat_id, referrer: str) -> bool:
+        """Только новому пользователю, не самому себе и только существующего пригласившего."""
+        chat_id, referrer = str(chat_id), str(referrer)
+        if chat_id == referrer or not self.user(referrer):
+            return False
+        done = bool(self._write("UPDATE users SET referrer=? WHERE chat_id=? AND referrer IS NULL",
+                                (referrer, chat_id)).rowcount)
+        if done:
+            self.log(referrer, "referral_join", chat_id)
+        return done
+
+    def referral_stats(self, chat_id) -> tuple[int, int]:
+        """(приглашено, из них оплатили)."""
+        row = self._one(
+            "SELECT COUNT(DISTINCT u.chat_id), COUNT(DISTINCT p.chat_id) FROM users u LEFT JOIN payments p "
+            "ON p.chat_id=u.chat_id AND p.status='approved' AND p.amount_kzt>0 WHERE u.referrer=?", (str(chat_id),))
+        return row[0], row[1]
 
     def users_page(self, offset: int, limit: int) -> list[sqlite3.Row]:
         return self._all(

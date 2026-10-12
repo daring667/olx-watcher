@@ -162,7 +162,7 @@ def user_json(user) -> dict:
     return {"chat_id": user["chat_id"], "username": user["username"], "first_name": user["first_name"],
             "last_name": user["last_name"], "joined_at": user["joined_at"], "last_seen_at": user["last_seen_at"],
             "paid_until": user["paid_until"], "plan": user["plan"], "blocked": bool(user["blocked"]),
-            "min_discount": user["min_discount"], "access": access(user)}
+            "min_discount": user["min_discount"], "access": access(user), "referrer": user["referrer"]}
 
 
 # --- Страница ---------------------------------------------------------------
@@ -192,6 +192,8 @@ def me():
         pending_payment=pending, cities=feed.CITIES,
         watches=[watch_json(row) for row in db.watches(user["chat_id"])],
         favorites_count=db.count("favorites", user["chat_id"]),
+        referral=dict(zip(("invited", "paid"), db.referral_stats(user["chat_id"])),
+                      link=feed.referral_link(g.token, user["chat_id"]), days=feed.REFERRAL_DAYS),
     )
 
 

@@ -467,6 +467,24 @@ async function profile() {
         const done = () => tg ? tg.close() : null;
         tg && tg.showAlert ? tg.showAlert("Пришлите скриншот чека в чат с ботом — я уже написал вам там.", done) : done();
       } }, "📸 Я оплатил — отправить чек"))),
+    me.referral.link ? h("div", {},
+      h("h2", {}, "Пригласи друга"),
+      h("div", { class: "card" },
+        h("div", { class: "title" }, "🎁 +" + me.referral.days + " дней за каждого друга"),
+        h("div", { class: "hint", style: "margin:4px 0 10px" }, "Когда друг по вашей ссылке оформит подписку, вам добавится " + me.referral.days + " дней доступа."),
+        h("div", { class: "meta", style: "margin-bottom:10px" }, h("span", {}, "👥 Пришло: " + me.referral.invited), h("span", {}, "💰 Оплатили: " + me.referral.paid)),
+        h("div", { class: "actions" },
+          h("button", { class: "btn", onclick: () => {
+            tap();
+            const text = "Бот присылает новые объявления OLX через минуту после публикации и показывает, насколько цена ниже рынка. 3 дня бесплатно:";
+            const url = "https://t.me/share/url?url=" + encodeURIComponent(me.referral.link) + "&text=" + encodeURIComponent(text);
+            tg && tg.openTelegramLink ? tg.openTelegramLink(url) : openLink(url);
+          } }, "📤 Поделиться"),
+          h("button", { class: "btn secondary", onclick: async () => {
+            tap();
+            try { await navigator.clipboard.writeText(me.referral.link); toast("Ссылка скопирована"); }
+            catch (e) { tg && tg.showAlert ? tg.showAlert(me.referral.link) : prompt("Ссылка", me.referral.link); }
+          } }, "📋 Копировать")))) : null,
     h("h2", {}, "Фильтр выгоды"),
     h("div", { class: "card" },
       filterSeg,
@@ -565,6 +583,7 @@ async function userCard(chatId) {
     h("div", { class: "card" },
       h("div", { class: "title" }, u.access.active ? (u.plan === "paid" ? "💰 Платный доступ" : "🎁 Пробный доступ") : "⏳ Доступ истёк"),
       h("div", { class: "hint" }, "до " + dateTime(u.paid_until) + (u.blocked ? " · 🚫 заблокировал бота" : "")),
+      u.referrer ? h("div", { class: "hint" }, "🎁 Пришёл по приглашению ID " + u.referrer) : null,
       h("div", { class: "meta" }, h("span", {}, "С нами с " + date(u.joined_at)), h("span", {}, "был " + (u.last_seen_at ? ago(u.last_seen_at) : "—")),
         h("span", {}, "📨 " + d.deliveries), h("span", {}, "⭐ " + d.favorites)),
       h("div", { class: "actions" }, grant(30, true, "💰 +30 дн. (оплата)")),

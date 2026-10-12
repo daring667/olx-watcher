@@ -27,7 +27,7 @@ import threading
 import time
 from collections import defaultdict, deque
 from datetime import datetime
-from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit, urlunsplit
 
 import requests
 from curl_cffi import requests as impersonated
@@ -35,7 +35,7 @@ from curl_cffi import requests as impersonated
 # Через модуль, а не `from … import`: тесты подменяют olx_watcher.telegram_request,
 # и подмена должна действовать и здесь.
 import olx_watcher as w
-from feed_db import DAY, FeedDB, is_excluded
+from feed_db import DAY, REFERRAL_DAYS, FeedDB, is_excluded
 
 DEFAULTS = {
     "enabled": False,
@@ -540,6 +540,7 @@ def home_screen(db: FeedDB, user, cfg: dict, owner_ids: set[str], greeting: str 
         [button("➕ Добавить поиск", "u:add"), button("📋 Мои поиски", "u:list")],
         [button("⭐ Избранное", "u:favs"), button("🎯 Фильтр выгоды", "u:filter")],
         [button("💳 Подписка", "u:sub"), button("❓ Как это работает", "u:help")],
+        [button(f"🎁 Пригласить друга (+{REFERRAL_DAYS} дн.)", "u:ref")],
     ]
     if owner:
         rows.append([button("👑 Админка", "a:home"), button("🎮 Видеокарты", "u:gpu")])
@@ -821,6 +822,8 @@ def handle_user_callback(token: str, db: FeedDB, user, callback: dict, verb: str
                               markup([button("⬅️ Отмена", "u:sub")])), message)
     elif verb == "help":
         show(token, chat_id, help_screen(cfg), message)
+    elif verb == "ref":
+        show(token, chat_id, invite_screen(db, token, user), message)
     elif verb == "del":
         show(token, chat_id, delete_screen(), message)
     elif verb == "delok":
@@ -891,12 +894,16 @@ def user_card(db: FeedDB, chat_id: str, cfg: dict) -> tuple[str, str]:
         f"  {datetime.fromtimestamp(p['created_at']):%d.%m} · {p['method']} · {p['status']} · "
         f"{p['days']} дн. · {money(p['amount_kzt'])}" for p in payments) or "  —"
     seen = date_text(user["last_seen_at"]) if user["last_seen_at"] else "—"
+    invited, invited_paid = db.referral_stats(chat_id)
+    referrer = db.user(user["referrer"]) if user["referrer"] else None
+    came = (f"\n🎁 Пришёл от @{html.escape(referrer['username'] or referrer['chat_id'])}" if referrer else "") + \
+        (f"\n👥 Пригласил: {invited}, оплатили {invited_paid}" if invited else "")
     text = (f"👤 <b>{name}</b> @{html.escape(user['username'] or '—')}\n"
             f"ID: <code>{chat_id}</code>\n"
             f"С нами с {date_text(user['joined_at'])}, заходил {seen}\n"
             f"{access_line(user, set())}" + (" · 🚫 заблокировал бота" if user["blocked"] else "") + "\n"
             f"🎯 Фильтр: {filter_text(user['min_discount'])}\n"
-            f"⭐ Избранное: {db.count('favorites', chat_id)} · 📨 получено: {db.count('deliveries', chat_id)}\n\n"
+            f"⭐ Избранное: {db.count('favorites', chat_id)} · 📨 получено: {db.count('deliveries', chat_id)}{came}\n\n"
             f"<b>Поиски:</b>\n{watch_lines}\n\n<b>Оплаты:</b>\n{payment_lines}")
     period, price = int(cfg["period_days"]), int(cfg["price_kzt"])
     return text, markup(
@@ -909,6 +916,46 @@ def notify_granted(db: FeedDB, token: str, user) -> None:
     safe_send(db, token, user["chat_id"],
               f"✅ <b>Доступ продлён до {date_text(user['paid_until'])}</b>\nСпасибо! Объявления снова приходят.",
               reply_markup=markup([HOME]))
+    if db.referral_reward:
+        referrer = db.user(db.referral_reward)
+        db.referral_reward = None
+        if referrer:
+            safe_send(db, token, referrer["chat_id"],
+                      f"🎁 <b>Ваш друг оформил подписку — вам +{REFERRAL_DAYS} дней!</b>\n"
+                      f"Доступ до {date_text(referrer['paid_until'])}. Приглашайте ещё 👇",
+                      reply_markup=markup([button("🎁 Пригласить друга", "u:ref")]))
+
+
+_bot_username: dict[str, str] = {}
+
+
+def bot_username(token: str) -> str:
+    """Имя бота для реферальной ссылки — один запрос getMe на процесс."""
+    if token not in _bot_username:
+        try:
+            _bot_username[token] = w.telegram_request(token, "getMe")["result"]["username"]
+        except (requests.RequestException, KeyError, TypeError):
+            return ""
+    return _bot_username[token]
+
+
+def referral_link(token: str, chat_id) -> str:
+    name = bot_username(token)
+    return f"https://t.me/{name}?start=ref_{chat_id}" if name else ""
+
+
+def invite_screen(db: FeedDB, token: str, user) -> tuple[str, str]:
+    url = referral_link(token, user["chat_id"])
+    invited, paid = db.referral_stats(user["chat_id"])
+    share = ("https://t.me/share/url?url=" + quote(url) + "&text=" +
+             quote("Бот присылает новые объявления OLX через минуту после публикации и показывает, "
+                   "насколько цена ниже рынка. 3 дня бесплатно:"))
+    return (f"🎁 <b>Пригласите друга — получите +{REFERRAL_DAYS} дней</b>\n\n"
+            f"Когда друг по вашей ссылке оформит подписку, вам добавится {REFERRAL_DAYS} дней доступа. "
+            "Друзей можно приглашать сколько угодно.\n\n"
+            f"Ваша ссылка:\n<code>{html.escape(url)}</code>\n\n"
+            f"👥 Пришло по ссылке: <b>{invited}</b> · оплатили: <b>{paid}</b>",
+            markup([link("📤 Поделиться ссылкой", share)], [HOME]) if url else markup([HOME]))
 
 
 def handle_admin_callback(token: str, db: FeedDB, owner, callback: dict, verb: str, arg: str,
@@ -1071,6 +1118,10 @@ def handle_public_update(token: str, connection, update: dict, config: dict | No
         send(token, chat_id, f"{message.get('text')}\n\n———\n📣 Отправить это {targets} пользователям?",
              reply_markup=markup([button("✅ Отправить", "a:bcgo"), button("❌ Отмена", "a:bcx")]))
         return True
+    if command == "/start" and created and not is_owner:
+        payload = text.split(maxsplit=1)[1] if " " in text else ""
+        if payload.startswith("ref_") and db.set_referrer(chat_id, payload[4:]):
+            user = db.user(chat_id)
     if command in {"/start", "/menu"}:
         greeting = ""
         if created and not is_owner:
