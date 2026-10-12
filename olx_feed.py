@@ -49,6 +49,8 @@ DEFAULTS = {
     "price_kzt": 5000,
     "period_days": 30,
     "proxy": "",
+    # HTTPS-адрес Mini App. Пустой — кнопки приложения в боте нет.
+    "miniapp_url": "",
     "payment_text": "Подписка платная. Напишите владельцу бота, чтобы продлить доступ.",
 }
 
@@ -57,6 +59,21 @@ DEFAULTS = {
 ORDER_KEY, ORDER_VALUE = "search[order]", "created_at:desc"
 OLX_URL = re.compile(r"https?://(?:www\.|m\.)?olx\.kz/[^\s<>\"']+", re.I)
 FILTER_STEPS = (0, 10, 20, 30, 40)
+
+# Города для конструктора поиска: адрес OLX → название. Каждый адрес проверен
+# запросом к OLX; «list» — весь Казахстан.
+CITIES = {
+    "list": "Весь Казахстан", "alma-ata": "Алматы", "astana": "Астана", "shymkent": "Шымкент",
+    "karaganda": "Караганда", "aktobe": "Актобе", "taraz": "Тараз", "pavlodar": "Павлодар",
+    "ust-kamenogorsk": "Усть-Каменогорск", "semey": "Семей", "atyrau": "Атырау",
+    "kostanay": "Костанай", "kyzylorda": "Кызылорда", "uralsk": "Уральск",
+    "petropavlovsk": "Петропавловск", "aktau": "Актау", "turkestan": "Туркестан",
+    "temirtau": "Темиртау", "kokshetau": "Кокшетау", "taldykorgan": "Талдыкорган",
+    "ekibastuz": "Экибастуз",
+}
+# Разделы сайта, которые не являются выдачей объявлений.
+NOT_LISTING = {"obyavlenie", "myaccount", "account", "adding", "favorites", "chat", "help",
+               "oferta", "login", "register", "payments", "messages"}
 
 PUBLIC_COMMANDS = [
     {"command": "start", "description": "Главное меню"},
@@ -87,7 +104,10 @@ def normalize_search_url(raw: str) -> str | None:
     if not match:
         return None
     parts = urlsplit(match.group(0).rstrip(".,;)"))
-    if "/obyavlenie/" in parts.path or "/d/" not in parts.path + "/":
+    # OLX отдаёт выдачу и как /d/alma-ata/…, и как /alma-ata/… (сейчас
+    # перенаправляет на второй вариант), поэтому /d/ не требуем.
+    segments = [s for s in parts.path.split("/") if s and s != "d"]
+    if not segments or "/obyavlenie/" in parts.path or segments[0] in NOT_LISTING:
         return None
     query = {k: v for k, v in parse_qsl(parts.query, keep_blank_values=True)
              if k != "page" and not k.startswith("utm_")}
@@ -96,17 +116,34 @@ def normalize_search_url(raw: str) -> str | None:
     return urlunsplit(("https", "www.olx.kz", path, urlencode(sorted(query.items())), ""))
 
 
+def build_search_url(query: str, city: str = "list", price_from: int | None = None,
+                     price_to: int | None = None) -> str | None:
+    """Ссылка выдачи из конструктора: запрос, город и цена — без копирования с OLX."""
+    words = re.sub(r"[^\w]+", "-", (query or "").strip().casefold()).strip("-")
+    if not words or city not in CITIES:
+        return None
+    url = f"https://www.olx.kz/{city}/q-{words}/"
+    query_params = []
+    if price_from:
+        query_params.append(f"search%5Bfilter_float_price%3Afrom%5D={int(price_from)}")
+    if price_to:
+        query_params.append(f"search%5Bfilter_float_price%3Ato%5D={int(price_to)}")
+    return normalize_search_url(url + ("?" + "&".join(query_params) if query_params else ""))
+
+
 def watch_title(search_url: str) -> str:
-    """Короткое имя поиска для списка: «q: iphone 13 · alma-ata»."""
+    """Короткое имя поиска для списка: «q: iphone 13 · Алматы»."""
     parts = urlsplit(search_url)
-    segments = [unquote(s) for s in parts.path.split("/") if s and s != "d"]
+    segments = [unquote(s) for s in parts.path.split("/") if s and s not in {"d", "list"}]
     words = [s[2:].replace("-", " ") for s in segments if s.startswith("q-")]
-    rest = [s for s in segments if not s.startswith("q-")]
+    rest = [CITIES.get(s, s) for s in segments if not s.startswith("q-")]
     label = " · ".join((["«" + words[0] + "»"] if words else []) + rest[-2:])
     query = dict(parse_qsl(parts.query))
     low, high = query.get("search[filter_float_price:from]"), query.get("search[filter_float_price:to]")
-    if low or high:
-        label += f" · {low or 0}–{high or '∞'} ₸"
+    if low and high:
+        label += f" · {money(int(float(low)))}–{money(int(float(high)))}"
+    elif low or high:
+        label += f" · {'от' if low else 'до'} {money(int(float(low or high)))}"
     return label or "поиск OLX"
 
 
@@ -398,6 +435,8 @@ def home_screen(db: FeedDB, user, cfg: dict, owner_ids: set[str], greeting: str 
         f"🎯 Присылаю: {filter_text(user['min_discount'])}\n"
         f"⭐ В избранном: {db.count('favorites', chat_id)}")
     rows = []
+    if cfg["miniapp_url"]:
+        rows.append([{"text": "📱 Открыть приложение", "web_app": {"url": cfg["miniapp_url"]}}])
     if not is_active(user, owner_ids):
         rows.append([button("💳 Продлить доступ", "u:sub")])
     rows += [
@@ -799,6 +838,19 @@ def handle_admin_callback(token: str, db: FeedDB, owner, callback: dict, verb: s
         show(token, chat_id, (f"📣 Рассылка завершена: доставлено {delivered} из {len(targets)}.",
                               markup([button("⬅️ Админка", "a:home")])), message)
     return ""
+
+
+def setup_menu_button(token: str, config: dict | None) -> None:
+    """Кнопка «Приложение» слева от поля ввода — во всех чатах с ботом."""
+    cfg = settings(config)
+    if not cfg["enabled"] or not cfg["miniapp_url"]:
+        return
+    try:
+        w.telegram_request(token, "setChatMenuButton", menu_button=json.dumps(
+            {"type": "web_app", "text": "Приложение", "web_app": {"url": cfg["miniapp_url"]}},
+            ensure_ascii=False))
+    except requests.RequestException as error:
+        logging.warning("Не удалось поставить кнопку приложения: %s", w.safe_error(error))
 
 
 # --- Вход из Telegram -------------------------------------------------------

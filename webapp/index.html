@@ -1,0 +1,557 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<title>OLX Радар</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+:root {
+  --bg: var(--tg-theme-secondary-bg-color, #f1f2f6);
+  --card: var(--tg-theme-section-bg-color, var(--tg-theme-bg-color, #ffffff));
+  --text: var(--tg-theme-text-color, #16181d);
+  --hint: var(--tg-theme-hint-color, #8a8f98);
+  --link: var(--tg-theme-link-color, #2a7ae2);
+  --accent: var(--tg-theme-button-color, #2a7ae2);
+  --accent-text: var(--tg-theme-button-text-color, #ffffff);
+  --danger: var(--tg-theme-destructive-text-color, #e5484d);
+  --sep: var(--tg-theme-section-separator-color, rgba(127, 127, 127, .18));
+  --good: #1fa463; --bad: #e5484d; --warn: #f2a516;
+  --radius: 14px;
+}
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+html, body { margin: 0; background: var(--bg); color: var(--text);
+  font: 15px/1.4 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif; }
+body { padding-bottom: calc(72px + env(safe-area-inset-bottom)); }
+button, input, select, textarea { font: inherit; color: inherit; }
+main { padding: 12px 12px 8px; max-width: 640px; margin: 0 auto; }
+h1 { font-size: 22px; margin: 6px 4px 12px; }
+h2 { font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em;
+  color: var(--hint); margin: 20px 4px 8px; }
+.card { background: var(--card); border-radius: var(--radius); padding: 14px; margin-bottom: 10px; }
+.card.flat { padding: 0; overflow: hidden; }
+.row { display: flex; align-items: center; gap: 10px; }
+.between { justify-content: space-between; }
+.grow { flex: 1; min-width: 0; }
+.hint { color: var(--hint); font-size: 13px; }
+.title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
+.clamp { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; border: 0;
+  border-radius: 12px; padding: 11px 14px; background: var(--accent); color: var(--accent-text);
+  font-weight: 600; cursor: pointer; width: 100%; }
+.btn.secondary { background: color-mix(in srgb, var(--accent) 12%, transparent); color: var(--accent); }
+.btn.danger { background: color-mix(in srgb, var(--danger) 12%, transparent); color: var(--danger); }
+.btn.small { width: auto; padding: 7px 11px; font-size: 14px; border-radius: 10px; }
+.btn:disabled { opacity: .5; }
+.btn:active { transform: scale(.98); }
+.pill { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; border-radius: 99px;
+  font-size: 12px; font-weight: 600; background: color-mix(in srgb, var(--hint) 16%, transparent); color: var(--hint); }
+.pill.good { background: color-mix(in srgb, var(--good) 16%, transparent); color: var(--good); }
+.pill.bad { background: color-mix(in srgb, var(--bad) 14%, transparent); color: var(--bad); }
+.pill.warn { background: color-mix(in srgb, var(--warn) 18%, transparent); color: #b87800; }
+.pill.accent { background: color-mix(in srgb, var(--accent) 14%, transparent); color: var(--accent); }
+.meta { display: flex; flex-wrap: wrap; gap: 6px 10px; margin-top: 6px; font-size: 13px; color: var(--hint); }
+.actions { display: flex; gap: 8px; margin-top: 12px; }
+.actions .btn { flex: 1; }
+.banner { border-radius: var(--radius); padding: 14px; margin-bottom: 10px;
+  background: color-mix(in srgb, var(--bad) 12%, var(--card)); }
+.banner.ok { background: color-mix(in srgb, var(--good) 10%, var(--card)); }
+.empty { text-align: center; padding: 36px 20px; color: var(--hint); }
+.empty .icon { font-size: 44px; margin-bottom: 8px; }
+.empty b { display: block; color: var(--text); font-size: 17px; margin-bottom: 4px; }
+
+/* Переключатель */
+.switch { position: relative; width: 46px; height: 28px; flex: none; }
+.switch input { opacity: 0; width: 0; height: 0; }
+.switch span { position: absolute; inset: 0; background: color-mix(in srgb, var(--hint) 35%, transparent);
+  border-radius: 99px; transition: .2s; }
+.switch span::before { content: ""; position: absolute; width: 22px; height: 22px; left: 3px; top: 3px;
+  background: #fff; border-radius: 50%; transition: .2s; box-shadow: 0 1px 3px rgba(0,0,0,.25); }
+.switch input:checked + span { background: var(--good); }
+.switch input:checked + span::before { transform: translateX(18px); }
+
+/* Формы */
+label.field { display: block; margin-bottom: 12px; }
+label.field > span { display: block; font-size: 13px; color: var(--hint); margin: 0 4px 6px; }
+.input { width: 100%; border: 1px solid var(--sep); background: var(--card); border-radius: 12px;
+  padding: 11px 12px; outline: none; }
+.input:focus { border-color: var(--accent); }
+textarea.input { min-height: 96px; resize: vertical; }
+.seg { display: flex; background: color-mix(in srgb, var(--hint) 14%, transparent); border-radius: 11px;
+  padding: 3px; gap: 3px; margin-bottom: 14px; }
+.seg button { flex: 1; border: 0; background: transparent; padding: 8px 6px; border-radius: 9px;
+  font-weight: 600; font-size: 14px; color: var(--hint); cursor: pointer; }
+.seg button.on { background: var(--card); color: var(--text); box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+
+/* Объявления */
+.ad { display: flex; gap: 12px; padding: 12px; border-bottom: 1px solid var(--sep); cursor: pointer; }
+.ad:last-child { border-bottom: 0; }
+.ad img, .ad .noimg { width: 76px; height: 76px; border-radius: 10px; object-fit: cover; flex: none;
+  background: color-mix(in srgb, var(--hint) 14%, transparent); display: grid; place-items: center; font-size: 26px; }
+.ad .price { font-weight: 700; margin-top: 4px; }
+.star { border: 0; background: none; font-size: 22px; padding: 0 2px; cursor: pointer; align-self: flex-start; }
+
+/* Статистика */
+.tiles { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin-bottom: 10px; }
+.tile { background: var(--card); border-radius: var(--radius); padding: 12px; }
+.tile b { display: block; font-size: 22px; }
+.tile.wide { grid-column: span 2; }
+.list-item { display: flex; align-items: center; gap: 10px; padding: 12px 14px; border-bottom: 1px solid var(--sep); cursor: pointer; }
+.list-item:last-child { border-bottom: 0; }
+.avatar { width: 38px; height: 38px; border-radius: 50%; flex: none; display: grid; place-items: center;
+  font-weight: 700; color: #fff; background: var(--accent); }
+
+/* Вкладки */
+nav { position: fixed; left: 0; right: 0; bottom: 0; display: flex; background: var(--card);
+  border-top: 1px solid var(--sep); padding: 6px 4px calc(6px + env(safe-area-inset-bottom)); z-index: 10; }
+nav button { flex: 1; border: 0; background: none; display: flex; flex-direction: column; align-items: center;
+  gap: 2px; font-size: 11px; color: var(--hint); padding: 4px 0; cursor: pointer; }
+nav button .i { font-size: 22px; line-height: 1; filter: grayscale(1); opacity: .7; }
+nav button.on { color: var(--accent); font-weight: 600; }
+nav button.on .i { filter: none; opacity: 1; }
+nav button .dot { position: absolute; margin-left: 22px; margin-top: -2px; min-width: 16px; height: 16px; border-radius: 8px;
+  background: var(--bad); color: #fff; font-size: 10px; display: grid; place-items: center; padding: 0 4px; }
+
+.toast { position: fixed; left: 50%; bottom: calc(84px + env(safe-area-inset-bottom)); transform: translateX(-50%);
+  background: rgba(20, 22, 28, .92); color: #fff; padding: 10px 16px; border-radius: 12px; font-size: 14px;
+  z-index: 20; max-width: 90%; text-align: center; animation: pop .2s; }
+@keyframes pop { from { opacity: 0; transform: translate(-50%, 8px); } }
+.skeleton { height: 84px; border-radius: var(--radius); margin-bottom: 10px;
+  background: linear-gradient(90deg, var(--card) 25%, color-mix(in srgb, var(--hint) 10%, var(--card)) 50%, var(--card) 75%);
+  background-size: 200% 100%; animation: shimmer 1.2s infinite; }
+@keyframes shimmer { to { background-position: -200% 0; } }
+.paytext { white-space: pre-wrap; margin-top: 10px; }
+details summary { cursor: pointer; font-weight: 600; list-style: none; }
+details summary::after { content: " ›"; color: var(--hint); }
+details[open] summary::after { content: " ⌄"; }
+.progress { height: 6px; border-radius: 3px; background: color-mix(in srgb, var(--hint) 18%, transparent); margin-top: 10px; overflow: hidden; }
+.progress i { display: block; height: 100%; background: var(--good); border-radius: 3px; }
+</style>
+</head>
+<body>
+<main id="view"></main>
+<nav id="tabs"></nav>
+<script>
+"use strict";
+const tg = window.Telegram && window.Telegram.WebApp;
+const S = { tab: "searches", me: null, stack: [], addMode: "builder", userPage: 0, userQuery: "" };
+const DAY = 86400;
+
+// --- Утилиты ---------------------------------------------------------------
+function h(tag, attrs, ...children) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v == null || v === false) continue;
+    if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
+    else if (k === "class") el.className = v;
+    else if (k === "html") el.innerHTML = v;
+    else el.setAttribute(k, v === true ? "" : v);
+  }
+  for (const c of children.flat()) if (c != null && c !== false) el.append(c.nodeType ? c : String(c));
+  return el;
+}
+const money = v => v == null ? "—" : v.toLocaleString("ru-RU").replace(/,/g, " ") + " ₸";
+const date = ts => new Date(ts * 1000).toLocaleDateString("ru-RU", { day: "numeric", month: "short" });
+const dateTime = ts => new Date(ts * 1000).toLocaleString("ru-RU", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+function ago(ts) {
+  const s = Date.now() / 1000 - ts;
+  if (s < 60) return "только что";
+  if (s < 3600) return Math.floor(s / 60) + " мин назад";
+  if (s < DAY) return Math.floor(s / 3600) + " ч назад";
+  return date(ts);
+}
+function haptic(kind) { try { tg && tg.HapticFeedback.notificationOccurred(kind); } catch (e) {} }
+function tap() { try { tg && tg.HapticFeedback.impactOccurred("light"); } catch (e) {} }
+function toast(text) {
+  document.querySelectorAll(".toast").forEach(t => t.remove());
+  const t = h("div", { class: "toast" }, text);
+  document.body.append(t);
+  setTimeout(() => t.remove(), 2600);
+}
+function confirmBox(text) {
+  return new Promise(resolve => tg && tg.showConfirm ? tg.showConfirm(text, resolve) : resolve(window.confirm(text)));
+}
+function openLink(url) { tg && tg.openLink ? tg.openLink(url) : window.open(url, "_blank"); }
+
+async function api(path, options = {}) {
+  const res = await fetch("api/" + path, {
+    method: options.method || "GET",
+    headers: { "Content-Type": "application/json", "X-Telegram-Init-Data": (tg && tg.initData) || "" },
+    body: options.body ? JSON.stringify(options.body) : undefined,
+  });
+  let data = {};
+  try { data = await res.json(); } catch (e) {}
+  if (!res.ok) {
+    const err = new Error(data.error || "Ошибка сервера (" + res.status + ")");
+    err.status = res.status;
+    throw err;
+  }
+  return data;
+}
+async function run(promise, okText) {
+  try {
+    const r = await promise;
+    if (okText) { haptic("success"); toast(okText); }
+    return r;
+  } catch (e) {
+    haptic("error");
+    if (tg && tg.showAlert) tg.showAlert(e.message); else alert(e.message);
+    throw e;
+  }
+}
+
+// --- Навигация --------------------------------------------------------------
+const TABS = [
+  { id: "searches", icon: "🔎", label: "Поиски" },
+  { id: "feed", icon: "📰", label: "Лента" },
+  { id: "favorites", icon: "⭐", label: "Избранное" },
+  { id: "profile", icon: "👤", label: "Профиль" },
+  { id: "admin", icon: "👑", label: "Админ", owner: true },
+];
+function renderTabs() {
+  const nav = document.getElementById("tabs");
+  nav.replaceChildren(...TABS.filter(t => !t.owner || (S.me && S.me.access.owner)).map(t =>
+    h("button", { class: S.tab === t.id && !S.stack.length ? "on" : "", onclick: () => { tap(); go(t.id); } },
+      h("span", { class: "i" }, t.icon), t.label)));
+}
+function go(tab) { S.tab = tab; S.stack = []; render(); }
+function push(screen) { S.stack.push(screen); render(); }
+function back() { S.stack.pop(); render(); }
+if (tg) tg.BackButton.onClick(back);
+
+const view = () => document.getElementById("view");
+function setView(...nodes) {
+  view().replaceChildren(...nodes.flat(Infinity).filter(n => n != null && n !== false));
+  window.scrollTo(0, 0);
+}
+function loading() { setView(h("div", { class: "skeleton" }), h("div", { class: "skeleton" }), h("div", { class: "skeleton" })); }
+
+function mainButton(text, handler) {
+  if (!tg) return;
+  tg.MainButton.offClick(tg.MainButton._handler || (() => {}));
+  if (!text) { tg.MainButton.hide(); return; }
+  tg.MainButton._handler = handler;
+  tg.MainButton.setText(text);
+  tg.MainButton.onClick(handler);
+  tg.MainButton.show();
+}
+
+async function render() {
+  renderTabs();
+  if (tg) S.stack.length ? tg.BackButton.show() : tg.BackButton.hide();
+  mainButton(null);
+  const screen = S.stack[S.stack.length - 1];
+  try {
+    if (screen) return await screen();
+    return await ({ searches, feed, favorites, profile, admin })[S.tab]();
+  } catch (e) {
+    setView(h("div", { class: "empty" }, h("div", { class: "icon" }, "⚠️"), h("b", {}, "Не удалось загрузить"), e.message,
+      h("div", { style: "margin-top:14px" }, h("button", { class: "btn small", onclick: render }, "Повторить"))));
+  }
+}
+async function loadMe() { S.me = await api("me"); document.title = S.me.brand; return S.me; }
+
+// --- Поиски -----------------------------------------------------------------
+function accessCard(me) {
+  const a = me.access;
+  if (a.owner) return null;
+  if (!a.active) return h("div", { class: "banner" },
+    h("div", { class: "title" }, "⏳ Доступ закончился"),
+    h("div", { class: "hint", style: "margin:4px 0 10px" }, "Новые объявления не приходят. Поиски и избранное сохранены."),
+    h("button", { class: "btn", onclick: () => go("profile") }, "Продлить подписку"));
+  const label = a.plan === "paid" ? "✅ Подписка" : "🎁 Пробный доступ";
+  return h("div", { class: "card row between", onclick: () => go("profile") },
+    h("div", {}, h("div", { class: "title" }, label), h("div", { class: "hint" }, "до " + dateTime(a.until))),
+    h("span", { class: "pill " + (a.until - Date.now() / 1000 < DAY ? "warn" : "good") }, a.left));
+}
+
+function watchCard(wch) {
+  const toggle = h("input", { type: "checkbox", checked: !wch.paused, onchange: async e => {
+    tap();
+    try { await run(api("watches/" + wch.id, { method: "PATCH", body: { paused: !e.target.checked } }),
+      e.target.checked ? "Поиск снова работает" : "Поиск на паузе"); render(); }
+    catch (_) { e.target.checked = !e.target.checked; }
+  } });
+  return h("div", { class: "card" },
+    h("div", { class: "row" },
+      h("div", { class: "grow" }, h("div", { class: "title clamp" }, wch.title),
+        h("div", { class: "meta" },
+          h("span", { class: "pill " + (wch.paused ? "" : "good") }, wch.paused ? "⏸ Пауза" : "● Активен"),
+          h("span", {}, "📨 " + wch.sent),
+          wch.last_sent_at ? h("span", {}, "🕐 " + ago(wch.last_sent_at)) : null)),
+      h("label", { class: "switch" }, toggle, h("span"))),
+    h("div", { class: "meta" }, "📊 ", wch.median ? h("span", {}, "Рынок: медиана ", h("b", {}, money(wch.median)), " · " + wch.samples + " объявл.")
+      : h("span", {}, "Рынок: собираю данные (" + wch.samples + " объявл.)")),
+    h("div", { class: "actions" },
+      h("button", { class: "btn secondary small", onclick: () => openLink(wch.url) }, "🌐 Открыть на OLX"),
+      h("button", { class: "btn danger small", onclick: async () => {
+        if (!(await confirmBox("Удалить поиск «" + wch.title + "»? Избранное останется."))) return;
+        await run(api("watches/" + wch.id, { method: "DELETE" }), "Поиск удалён"); render();
+      } }, "🗑 Удалить")));
+}
+
+async function searches() {
+  if (!S.me) loading();
+  const me = await loadMe();
+  renderTabs();
+  const limit = me.max_watches == null ? "∞" : me.max_watches;
+  const full = me.max_watches != null && me.watches.length >= me.max_watches;
+  setView(
+    h("h1", {}, "🔎 " + me.brand),
+    accessCard(me),
+    h("button", { class: "btn", disabled: full || !me.access.active, onclick: () => { tap(); push(addSearch); } },
+      full ? "Достигнут лимит поисков" : "＋ Новый поиск"),
+    h("h2", {}, "Мои поиски · " + me.watches.length + " из " + limit),
+    me.watches.length ? me.watches.map(watchCard) : h("div", { class: "card empty" },
+      h("div", { class: "icon" }, "🔎"), h("b", {}, "Пока ни одного поиска"),
+      "Добавьте поиск — и я буду присылать новые объявления через 1–2 минуты после публикации."));
+}
+
+async function addSearch() {
+  const me = S.me || await loadMe();
+  const query = h("input", { class: "input", placeholder: "Например: iPhone 13 128GB", autocomplete: "off" });
+  const city = h("select", { class: "input" }, Object.entries(me.cities).map(([slug, name]) =>
+    h("option", { value: slug, selected: slug === "alma-ata" }, name)));
+  const low = h("input", { class: "input", inputmode: "numeric", placeholder: "от" });
+  const high = h("input", { class: "input", inputmode: "numeric", placeholder: "до" });
+  const link = h("textarea", { class: "input", placeholder: "https://www.olx.kz/…" });
+  const builder = S.addMode === "builder";
+  const digits = v => v.value.replace(/\D/g, "");
+  [low, high].forEach(i => i.addEventListener("input", () => {
+    const d = digits(i); i.value = d ? Number(d).toLocaleString("ru-RU") : "";
+  }));
+  const submit = async () => {
+    const payload = builder
+      ? { query: query.value.trim(), city: city.value, price_from: digits(low), price_to: digits(high) }
+      : { url: link.value.trim() };
+    if (builder && !payload.query) { haptic("error"); query.focus(); return toast("Напишите, что ищем"); }
+    if (!builder && !payload.url) { haptic("error"); link.focus(); return toast("Вставьте ссылку с OLX"); }
+    if (tg) tg.MainButton.showProgress();
+    try { await run(api("watches", { method: "POST", body: payload }), "✅ Поиск добавлен"); S.stack = []; render(); }
+    catch (_) {}
+    finally { if (tg) tg.MainButton.hideProgress(); }
+  };
+  setView(
+    h("h1", {}, "Новый поиск"),
+    h("div", { class: "seg" },
+      h("button", { class: builder ? "on" : "", onclick: () => { S.addMode = "builder"; render(); } }, "Конструктор"),
+      h("button", { class: builder ? "" : "on", onclick: () => { S.addMode = "link"; render(); } }, "Ссылка с OLX")),
+    builder ? h("div", {},
+      h("label", { class: "field" }, h("span", {}, "Что ищем"), query),
+      h("label", { class: "field" }, h("span", {}, "Город"), city),
+      h("label", { class: "field" }, h("span", {}, "Цена, ₸"), h("div", { class: "row" }, low, high)),
+      h("div", { class: "hint", style: "margin:0 4px 12px" }, "💡 Чем точнее запрос, тем точнее оценка «дешевле рынка». Нужны фильтры по категории или состоянию — используйте ссылку с OLX."))
+    : h("div", {},
+      h("div", { class: "card" },
+        h("div", { class: "title" }, "Как получить ссылку"),
+        h("ol", { class: "hint", style: "margin:8px 0 12px;padding-left:20px" },
+          h("li", {}, "Откройте OLX, выберите категорию и город."),
+          h("li", {}, "Выставьте фильтры: цена, состояние, ключевые слова."),
+          h("li", {}, "Скопируйте адрес страницы и вставьте сюда.")),
+        h("button", { class: "btn secondary", onclick: () => openLink("https://www.olx.kz/") }, "🌐 Открыть OLX")),
+      h("label", { class: "field" }, h("span", {}, "Ссылка на выдачу"), link)),
+    tg ? null : h("button", { class: "btn", onclick: submit }, "Следить за поиском"));
+  mainButton("Следить за поиском", submit);
+  (builder ? query : link).focus();
+}
+
+// --- Лента и избранное ------------------------------------------------------
+function discountPill(d) {
+  if (d == null) return null;
+  if (d >= 60) return h("span", { class: "pill warn" }, "⚠️ −" + d + "% подозрительно");
+  if (d >= 10) return h("span", { class: "pill good" }, "🔥 −" + d + "% к рынку");
+  if (d <= -10) return h("span", { class: "pill bad" }, "+" + (-d) + "% к рынку");
+  return h("span", { class: "pill" }, "≈ рынок");
+}
+function adRow(ad, onStar) {
+  const star = h("button", { class: "star", onclick: e => { e.stopPropagation(); tap(); onStar(ad, star); } }, ad.favorite ? "⭐" : "☆");
+  return h("div", { class: "ad", onclick: () => openLink(ad.url) },
+    ad.image ? h("img", { src: ad.image, loading: "lazy", alt: "", onerror: e => e.target.replaceWith(h("div", { class: "noimg" }, "📦")) })
+      : h("div", { class: "noimg" }, "📦"),
+    h("div", { class: "grow" },
+      h("div", { class: "clamp" }, ad.title || "Объявление"),
+      h("div", { class: "price" }, ad.price != null ? money(ad.price) : "цена не указана"),
+      h("div", { class: "meta" }, discountPill(ad.discount), h("span", {}, ago(ad.at)))),
+    star);
+}
+async function feed() {
+  loading();
+  const [{ items }, me] = await Promise.all([api("feed"), S.me ? S.me : loadMe()]);
+  const filter = me.user.min_discount ? "только от " + me.user.min_discount + "% дешевле рынка" : "все новые";
+  setView(
+    h("h1", {}, "📰 Лента"),
+    h("div", { class: "card row between", onclick: () => go("profile") },
+      h("div", {}, h("div", { class: "hint" }, "Присылаю"), h("div", { class: "title" }, filter)),
+      h("span", { class: "pill accent" }, "Изменить")),
+    items.length ? h("div", { class: "card flat" }, items.map(ad => adRow(ad, async (a, star) => {
+      const r = await run(api("feed/" + a.id + "/favorite", { method: "POST" }));
+      a.favorite = r.favorite; star.textContent = r.favorite ? "⭐" : "☆";
+      toast(r.favorite ? "⭐ В избранном" : "Убрано из избранного");
+    }))) : h("div", { class: "card empty" }, h("div", { class: "icon" }, "📭"), h("b", {}, "Пока пусто"),
+      "Здесь будут все объявления, которые я пришлю по вашим поискам."));
+}
+async function favorites() {
+  loading();
+  const { items } = await api("favorites");
+  setView(
+    h("h1", {}, "⭐ Избранное"),
+    items.length ? h("div", { class: "card flat" }, items.map(ad => adRow(ad, async (a, star) => {
+      await run(api("favorites/" + a.id, { method: "DELETE" }), "Убрано из избранного");
+      star.closest(".ad").remove();
+    }))) : h("div", { class: "card empty" }, h("div", { class: "icon" }, "⭐"), h("b", {}, "Избранное пустое"),
+      "Нажимайте ☆ в ленте или «⭐ В избранное» под объявлением в чате."));
+}
+
+// --- Профиль ----------------------------------------------------------------
+async function profile() {
+  if (!S.me) loading();
+  const me = await loadMe();
+  const u = me.user, a = me.access;
+  const name = [u.first_name, u.last_name].filter(Boolean).join(" ") || "Пользователь";
+  const total = (a.plan === "paid" ? me.period_days : 3) * DAY;
+  const pct = Math.max(0, Math.min(100, (a.until - Date.now() / 1000) / total * 100));
+  const filterSeg = h("div", { class: "seg" }, me.filter_steps.map(step =>
+    h("button", { class: u.min_discount === step ? "on" : "", onclick: async () => {
+      tap(); await run(api("settings", { method: "POST", body: { min_discount: step } }), "Сохранено"); render();
+    } }, step ? "от " + step + "%" : "Все")));
+  setView(
+    h("div", { class: "card row" },
+      h("div", { class: "avatar" }, name[0].toUpperCase()),
+      h("div", { class: "grow" }, h("div", { class: "title" }, name), h("div", { class: "hint" }, u.username ? "@" + u.username : "ID " + u.chat_id))),
+    h("h2", {}, "Подписка"),
+    a.owner ? h("div", { class: "card" }, "👑 Вы владелец — доступ без ограничений.") :
+    h("div", { class: "card" },
+      h("div", { class: "row between" },
+        h("div", {}, h("div", { class: "title" }, a.active ? (a.plan === "paid" ? "✅ Подписка активна" : "🎁 Пробный доступ") : "⏳ Доступ закончился"),
+          h("div", { class: "hint" }, a.active ? "до " + dateTime(a.until) + " · " + a.left : "закончился " + dateTime(a.until))),
+        h("div", { style: "text-align:right" }, h("div", { class: "title" }, money(me.price)), h("div", { class: "hint" }, me.period_days + " дней"))),
+      a.active ? h("div", { class: "progress" }, h("i", { style: "width:" + pct + "%" })) : null,
+      h("div", { class: "paytext", html: me.payment_text.replace(/\n/g, "<br>") }),
+      me.pending_payment ? h("div", { class: "banner ok", style: "margin:12px 0 0" }, "⏳ Ваш чек на проверке — обычно до часа.") : null,
+      h("div", { class: "actions" }, h("button", { class: "btn", onclick: async () => {
+        await run(api("paid", { method: "POST" }));
+        const done = () => tg ? tg.close() : null;
+        tg && tg.showAlert ? tg.showAlert("Пришлите скриншот чека в чат с ботом — я уже написал вам там.", done) : done();
+      } }, "📸 Я оплатил — отправить чек"))),
+    h("h2", {}, "Фильтр выгоды"),
+    h("div", { class: "card" },
+      filterSeg,
+      h("div", { class: "hint" }, "Сравниваю цену каждого нового объявления с медианой по вашему поиску за 30 дней. «от 20%» — присылать только то, что минимум на 20% дешевле рынка.")),
+    h("h2", {}, "Помощь"),
+    h("div", { class: "card" }, h("details", {},
+      h("summary", {}, "Как это работает"),
+      h("div", { class: "hint", style: "margin-top:8px" },
+        "Я проверяю ваши поиски на OLX каждые пару минут и присылаю только новые объявления — раньше, чем их заметят другие. ",
+        "К каждому — оценка цены: 🔥 дешевле рынка, ≈ около рынка, дороже рынка, ⚠️ подозрительно дёшево (часто мошенники).")))
+  );
+}
+
+// --- Админка ----------------------------------------------------------------
+async function admin() {
+  loading();
+  const { stats: s, pending, broadcast_targets } = await api("admin/stats");
+  const tile = (label, value, wide) => h("div", { class: "tile" + (wide ? " wide" : "") }, h("b", {}, value), h("span", { class: "hint" }, label));
+  const text = h("textarea", { class: "input", placeholder: "Текст рассылки (можно HTML Telegram)" });
+  setView(
+    h("h1", {}, "👑 Админка"),
+    h("div", { class: "tiles" },
+      tile("Выручка за 30 дней · всего " + money(s.revenue_total), money(s.revenue_30d), true),
+      tile("Пользователей", s.users), tile("Новых сегодня / 7 дн.", s.new_today + " / " + s.new_7d),
+      tile("Платный доступ", s.paid), tile("Пробный доступ", s.trial),
+      tile("Платили хоть раз", s.ever_paid), tile("Заходили за 7 дн.", s.active_7d),
+      tile("Отправлено сегодня", s.sent_today), tile("Поисков / выдач", s.watches + " / " + s.urls),
+      tile("В избранном", s.favorites), tile("Заблокировали бота", s.blocked)),
+    h("h2", {}, "Чеки на проверке · " + pending.length),
+    pending.length ? h("div", { class: "card flat" }, pending.map(p => h("div", { class: "list-item" },
+      h("div", { class: "grow", onclick: () => push(() => userCard(p.chat_id)) },
+        h("div", { class: "title" }, "#" + p.id + " · " + (p.username ? "@" + p.username : p.first_name || p.chat_id)),
+        h("div", { class: "hint" }, dateTime(p.created_at) + " · фото чека — в чате с ботом")),
+      h("button", { class: "btn small", onclick: async () => { await run(api("admin/payments/" + p.id + "/approve", { method: "POST" }), "✅ Доступ продлён"); render(); } }, "✅"),
+      h("button", { class: "btn danger small", onclick: async () => {
+        if (!(await confirmBox("Отклонить чек #" + p.id + "?"))) return;
+        await run(api("admin/payments/" + p.id + "/reject", { method: "POST" }), "Чек отклонён"); render(); } }, "✕"))))
+      : h("div", { class: "card hint" }, "Нет чеков на проверке 👌"),
+    h("h2", {}, "Пользователи"),
+    h("button", { class: "btn secondary", onclick: () => push(users) }, "👥 Все пользователи · " + s.users),
+    h("h2", {}, "Рассылка"),
+    h("div", { class: "card" }, text, h("div", { class: "actions" }, h("button", { class: "btn", onclick: async () => {
+      if (!text.value.trim()) return toast("Напишите текст");
+      if (!(await confirmBox("Отправить рассылку " + broadcast_targets + " пользователям?"))) return;
+      const r = await run(api("admin/broadcast", { method: "POST", body: { text: text.value } }));
+      text.value = ""; haptic("success"); toast("📣 Отправляю " + r.queued + " пользователям");
+    } }, "📣 Отправить всем · " + broadcast_targets))));
+}
+
+async function users() {
+  const search = h("input", { class: "input", placeholder: "Поиск: имя, @username или ID", value: S.userQuery });
+  const list = h("div", { class: "card flat" });
+  const load = async () => {
+    const { items } = await api("admin/users?page=" + S.userPage + "&q=" + encodeURIComponent(S.userQuery));
+    list.replaceChildren(...(items.length ? items.map(u => {
+      const name = u.username ? "@" + u.username : ([u.first_name, u.last_name].filter(Boolean).join(" ") || u.chat_id);
+      const a = u.access;
+      const pill = u.blocked ? h("span", { class: "pill bad" }, "🚫") : !a.active ? h("span", { class: "pill" }, "истёк")
+        : a.plan === "paid" ? h("span", { class: "pill good" }, "💰 " + date(u.paid_until)) : h("span", { class: "pill accent" }, "🎁 " + date(u.paid_until));
+      return h("div", { class: "list-item", onclick: () => push(() => userCard(u.chat_id)) },
+        h("div", { class: "avatar" }, (name.replace("@", "")[0] || "?").toUpperCase()),
+        h("div", { class: "grow" }, h("div", { class: "title" }, name),
+          h("div", { class: "hint" }, "🔍 " + u.watches + " · был " + (u.last_seen_at ? ago(u.last_seen_at) : "—"))),
+        pill);
+    }) : [h("div", { class: "empty" }, "Никого не нашлось")]));
+  };
+  let timer;
+  search.addEventListener("input", () => { clearTimeout(timer); timer = setTimeout(() => { S.userQuery = search.value; S.userPage = 0; load(); }, 300); });
+  setView(h("h1", {}, "👥 Пользователи"), h("label", { class: "field" }, search), list,
+    h("div", { class: "actions" },
+      h("button", { class: "btn secondary small", onclick: () => { if (S.userPage > 0) { S.userPage--; load(); } } }, "◀ Назад"),
+      h("button", { class: "btn secondary small", onclick: () => { S.userPage++; load(); } }, "Ещё ▶")));
+  await load();
+}
+
+async function userCard(chatId) {
+  loading();
+  const d = await api("admin/users/" + chatId);
+  const u = d.user;
+  const name = [u.first_name, u.last_name].filter(Boolean).join(" ") || "—";
+  const grant = (days, paid, label) => h("button", { class: "btn " + (days < 0 ? "danger" : paid ? "" : "secondary") + " small", onclick: async () => {
+    if (!(await confirmBox(label + " для " + name + "?"))) return;
+    await run(api("admin/users/" + chatId + "/grant", { method: "POST", body: { days, paid } }), "Готово"); render();
+  } }, label);
+  setView(
+    h("div", { class: "card row" }, h("div", { class: "avatar" }, name[0].toUpperCase()),
+      h("div", { class: "grow" }, h("div", { class: "title" }, name),
+        h("div", { class: "hint" }, (u.username ? "@" + u.username + " · " : "") + "ID " + u.chat_id))),
+    h("div", { class: "card" },
+      h("div", { class: "title" }, u.access.active ? (u.plan === "paid" ? "💰 Платный доступ" : "🎁 Пробный доступ") : "⏳ Доступ истёк"),
+      h("div", { class: "hint" }, "до " + dateTime(u.paid_until) + (u.blocked ? " · 🚫 заблокировал бота" : "")),
+      h("div", { class: "meta" }, h("span", {}, "С нами с " + date(u.joined_at)), h("span", {}, "был " + (u.last_seen_at ? ago(u.last_seen_at) : "—")),
+        h("span", {}, "📨 " + d.deliveries), h("span", {}, "⭐ " + d.favorites)),
+      h("div", { class: "actions" }, grant(30, true, "💰 +30 дн. (оплата)")),
+      h("div", { class: "actions" }, grant(3, false, "🎁 +3 дня"), grant(7, false, "🎁 +7 дней"), grant(-1, false, "−1 день"))),
+    h("h2", {}, "Поиски · " + d.watches.length),
+    d.watches.length ? h("div", { class: "card flat" }, d.watches.map(wch => h("div", { class: "list-item", onclick: () => openLink(wch.url) },
+      h("div", { class: "grow" }, h("div", { class: "title" }, wch.title), h("div", { class: "hint" }, (wch.paused ? "⏸ пауза" : "● активен") + " · 📨 " + wch.sent)))))
+      : h("div", { class: "card hint" }, "Нет поисков"),
+    h("h2", {}, "Оплаты"),
+    d.payments.length ? h("div", { class: "card flat" }, d.payments.map(p => h("div", { class: "list-item" },
+      h("div", { class: "grow" }, h("div", {}, dateTime(p.created_at) + " · " + (p.method === "receipt" ? "чек" : "вручную")),
+        h("div", { class: "hint" }, p.days + " дн. · " + money(p.amount_kzt))),
+      h("span", { class: "pill " + (p.status === "approved" ? "good" : p.status === "rejected" ? "bad" : "warn") },
+        { approved: "подтверждён", rejected: "отклонён", pending: "на проверке" }[p.status] || p.status))))
+      : h("div", { class: "card hint" }, "Оплат пока не было"));
+}
+
+// --- Старт ------------------------------------------------------------------
+if (tg) {
+  tg.ready(); tg.expand();
+  try { tg.setHeaderColor("secondary_bg_color"); tg.setBackgroundColor("secondary_bg_color"); } catch (e) {}
+}
+if (!tg || !tg.initData) {
+  setView(h("div", { class: "empty" }, h("div", { class: "icon" }, "📱"), h("b", {}, "Откройте из Telegram"),
+    "Это приложение работает внутри Telegram: нажмите кнопку «Приложение» в чате с ботом."));
+} else {
+  render();
+}
+</script>
+</body>
+</html>

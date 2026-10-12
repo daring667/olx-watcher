@@ -84,7 +84,22 @@ def test_not_a_search_url(text):
 
 def test_watch_title_is_readable():
     title = olx_feed.watch_title(olx_feed.normalize_search_url(SEARCH))
-    assert "«iphone 13»" in title and "alma-ata" in title and "200000" in title
+    assert title == "«iphone 13» · telefony · Алматы · до 200 000 ₸"
+
+
+def test_search_builder():
+    url = olx_feed.build_search_url("iPhone 13 Pro", "alma-ata", None, 200000)
+    assert url.startswith("https://www.olx.kz/alma-ata/q-iphone-13-pro/?")
+    assert "filter_float_price%3Ato%5D=200000" in url and "created_at%3Adesc" in url
+    assert olx_feed.build_search_url("", "alma-ata") is None
+    assert olx_feed.build_search_url("iphone", "нет-такого") is None
+
+
+def test_links_without_d_prefix_are_accepted():
+    """OLX теперь перенаправляет /d/alma-ata/… на /alma-ata/…"""
+    assert olx_feed.normalize_search_url("https://www.olx.kz/alma-ata/q-iphone/")
+    assert olx_feed.normalize_search_url("https://www.olx.kz/") is None
+    assert olx_feed.normalize_search_url("https://www.olx.kz/myaccount/") is None
 
 
 # --- Оценка рынка -----------------------------------------------------------

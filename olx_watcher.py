@@ -1279,6 +1279,7 @@ def main(debug_count: int | None = None) -> None:
                          daemon=True, name="public-feed").start()
         logging.info("Публичный режим включён")
     register_commands(token, owner_ids, public)
+    olx_feed.setup_menu_button(token, config)
     logging.info("Помощник запущен: обход раз в %s сек.; команды Telegram по «/»", config["poll_interval_seconds"])
     try:
         while True:

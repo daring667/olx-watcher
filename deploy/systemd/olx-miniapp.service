@@ -1,0 +1,23 @@
+[Unit]
+Description=OLX Radar Telegram Mini App
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{RUN_USER}}
+WorkingDirectory={{PROJECT_DIR}}
+# Только localhost: наружу приложение выставляет Tailscale Funnel по HTTPS
+# (tailscale serve --set-path /olx http://127.0.0.1:5051), как Mini App TikTok-бота.
+Environment="MINIAPP_LISTEN=127.0.0.1:5051"
+ExecStart={{PROJECT_DIR}}/venv/bin/python miniapp.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=olx-miniapp
+MemoryHigh=200M
+MemoryMax=300M
+
+[Install]
+WantedBy=multi-user.target

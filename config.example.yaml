@@ -307,6 +307,13 @@ feed:
   # хотя бы min_samples объявлений с ценой.
   min_samples: 8
   window_days: 30
+  # Название в сообщениях и в приложении.
+  brand: "OLX Радар"
+  # Цена и срок подписки: по ним считаются выручка и кнопка «+30 дн.» у чека.
+  price_kzt: 5000
+  period_days: 30
+  # HTTPS-адрес Mini App (miniapp.py за Tailscale Funnel). Пусто — без приложения.
+  miniapp_url: "https://debian-2.tail4f778c.ts.net/olx/"
   # Прокси для запросов к OLX, если начнёт банить: "http://user:pass@host:port".
   proxy: ""
   # Показывается по /status и когда доступ закончился. HTML-разметка Telegram.
