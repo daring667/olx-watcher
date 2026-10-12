@@ -541,3 +541,30 @@ def test_healthcheck_feed_staleness(bot):
     assert "не опрашивался" in healthcheck.feed_problems(db.c, {OWNER})[0]
     db.set_user("777", paid_until=1)  # у всех истёк доступ — опрос и не должен идти
     assert healthcheck.feed_problems(db.c, {OWNER}) == []
+
+
+def test_healthcheck_alert_is_escaped_and_marked_only_when_sent(tmp_path, monkeypatch):
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "deploy"))
+    import healthcheck
+
+    sent = []
+    monkeypatch.setattr(healthcheck, "STATE_PATH", tmp_path / "h.sqlite3")
+    monkeypatch.setattr(healthcheck, "load_dotenv", lambda path: None)
+    monkeypatch.setattr(healthcheck, "load_config", lambda: {})
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", OWNER)
+    monkeypatch.setattr(healthcheck, "unit_problems", lambda: [])
+    monkeypatch.setattr(healthcheck, "app_problems", lambda: ["приложение не отвечает: <urlopen error>"])
+
+    def fail(*a, **kw):
+        raise olx_watcher.requests.RequestException("400")
+
+    monkeypatch.setattr(healthcheck, "telegram_request", fail)
+    healthcheck.main()
+    connection = sqlite3.connect(tmp_path / "h.sqlite3")
+    assert healthcheck.meta(connection, "monitor_alert_at") == ""  # не дошло — повторим в следующий раз
+    monkeypatch.setattr(healthcheck, "telegram_request", lambda *a, **kw: sent.append(kw))
+    healthcheck.main()
+    assert "&lt;urlopen error&gt;" in sent[0]["text"]
+    assert healthcheck.meta(connection, "monitor_alert_at") != ""

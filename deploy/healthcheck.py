@@ -14,6 +14,7 @@ tiktokbot-monitor у TikTok-бота). Проверяет:
 """
 from __future__ import annotations
 
+import html
 import os
 import sqlite3
 import subprocess
@@ -42,12 +43,19 @@ def unit_problems() -> list[str]:
     return problems
 
 
-def app_problems() -> list[str]:
-    try:
-        with urllib.request.urlopen(APP_HEALTH, timeout=5) as response:
-            return [] if response.status == 200 else [f"приложение ответило {response.status}"]
-    except OSError as error:
-        return [f"приложение не отвечает: {error}"]
+def app_problems(retry_after: float = 10) -> list[str]:
+    """Не ответило — перепроверяем через 10 с: таймер мог попасть ровно в перезапуск."""
+    for attempt in (1, 2):
+        try:
+            with urllib.request.urlopen(APP_HEALTH, timeout=5) as response:
+                if response.status == 200:
+                    return []
+                problem = f"приложение ответило {response.status}"
+        except OSError as error:
+            problem = f"приложение не отвечает: {getattr(error, 'reason', error)}"
+        if attempt == 1:
+            time.sleep(retry_after)
+    return [problem]
 
 
 def feed_problems(connection: sqlite3.Connection, owner_ids: set[str]) -> list[str]:
@@ -90,18 +98,24 @@ def main() -> int:
     failing = meta(connection, "monitor_failing") == "1"
     now = int(time.time())
     text = ""
-    if problems and now - int(meta(connection, "monitor_alert_at", "0")) >= ALERT_EVERY:
-        text = "🚨 <b>Радар объявлений: проблема</b>\n" + "\n".join(f"• {p}" for p in problems)
-        set_meta(connection, "monitor_alert_at", str(now))
+    alert = bool(problems) and now - int(meta(connection, "monitor_alert_at", "0")) >= ALERT_EVERY
+    if alert:
+        # Текст ошибок экранируем: «<urlopen error …>» Telegram принимал за HTML-тег
+        # и отвергал всё сообщение.
+        text = "🚨 <b>Радар объявлений: проблема</b>\n" + "\n".join(f"• {html.escape(p)}" for p in problems)
     elif not problems and failing:
         text = "✅ <b>Радар объявлений снова работает</b>"
-    set_meta(connection, "monitor_failing", "1" if problems else "0")
+    delivered = False
     for owner in owners:
         if text:
             try:
                 telegram_request(token, "sendMessage", chat_id=owner, text=text, parse_mode="HTML")
+                delivered = True
             except Exception as error:  # мониторинг не должен падать из-за Telegram
                 print(f"Не отправлено: {safe_error(error)}")
+    if alert and delivered:  # отметку ставим, только если тревога реально дошла
+        set_meta(connection, "monitor_alert_at", str(now))
+    set_meta(connection, "monitor_failing", "1" if problems else "0")
     print("; ".join(problems) or "OK")
     return 1 if problems else 0
 
