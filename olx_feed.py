@@ -38,7 +38,7 @@ from feed_db import DAY, FeedDB
 
 DEFAULTS = {
     "enabled": False,
-    "brand": "OLX Радар",
+    "brand": "Радар объявлений",
     "poll_seconds": 120,
     "url_delay_seconds": 2,
     "seed_pages": 3,
