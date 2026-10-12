@@ -124,9 +124,13 @@ def extract_listings(search_url: str, page: str, limit: int) -> list[Listing]:
         if not ad_id:
             continue
         image = card.select_one("img[src], img[data-src]")
+        # Цену берём из её собственного узла: в общем тексте карточки она идёт
+        # сразу за заголовком, и «iPhone 17 Pro Max 256» + «560 000 тг»
+        # склеивалось в 256 560 000 ₸.
+        price_node = card.select_one('[data-testid="ad-price"]')
         found.setdefault(ad_id, Listing(
             ad_id, url, card_title(card, link),
-            extract_price(text(card)), image_url=(image.get("src") or image.get("data-src")) if image else None,
+            extract_price(text(price_node or card)), image_url=(image.get("src") or image.get("data-src")) if image else None,
             search_url=search_url,
         ))
         if len(found) >= limit:
@@ -874,6 +878,8 @@ BOT_COMMANDS = [
     {"command": "setprice", "description": "Потолок цены: /setprice 80000"},
     {"command": "remind", "description": "Напомнить об объявлении: /remind ID… 2d"},
     {"command": "help", "description": "Что умеет бот"},
+    {"command": "users", "description": "Пользователи публичного режима"},
+    {"command": "grant", "description": "Продлить доступ: /grant ID 30"},
 ]
 
 HELP_TEXT = (
@@ -882,7 +888,11 @@ HELP_TEXT = (
     "/setprice &lt;сумма&gt; — потолок цены; <code>reset</code> вернёт значение из конфига\n"
     "/remind &lt;ID или ссылка&gt; &lt;срок&gt; — напоминание, срок вида 30m, 2h, 1d\n"
     "/favorites — избранное от дешёвых к дорогим\n"
-    "/menu — кнопки: пауза, профили, сводка, избранное"
+    "/menu — кнопки: пауза, профили, сводка, избранное\n\n"
+    "<b>Публичный режим</b>\n"
+    "/users — пользователи и сроки доступа\n"
+    "/grant &lt;ID или @username&gt; &lt;дни&gt; — продлить доступ\n"
+    "Ссылка на выдачу OLX — следить за ней самому; /list — мои поиски"
 )
 
 
@@ -917,17 +927,31 @@ def deal_keyboard(ad_id: str, deal_status: str) -> dict:
     ]}
 
 
-def register_commands(token: str) -> None:
+def register_commands(token: str, owner_ids: set[str] = frozenset(), public: bool = False) -> None:
     """Регистрирует меню команд, чтобы Telegram подсказывал их по «/».
+
+    В публичном режиме общее меню — команды для посторонних, а полное меню
+    владельца ставится только на его чаты: иначе каждый пользователь видел
+    бы /favorites и /grant, которые ему не ответят.
 
     Сбой здесь не должен мешать обходу: подсказки — удобство, а не условие
     работы, поэтому ошибка только пишется в лог.
     """
+    import olx_feed
     try:
-        telegram_request(token, "setMyCommands",
-                         commands=json.dumps(BOT_COMMANDS, ensure_ascii=False))
-        logging.info("Меню команд Telegram обновлено: %d штук", len(BOT_COMMANDS))
-    except requests.RequestException as error:
+        if not public:
+            telegram_request(token, "setMyCommands",
+                             commands=json.dumps(BOT_COMMANDS, ensure_ascii=False))
+        else:
+            telegram_request(token, "setMyCommands",
+                             commands=json.dumps(olx_feed.PUBLIC_COMMANDS, ensure_ascii=False))
+            extra = [c for c in olx_feed.PUBLIC_COMMANDS if c["command"] in {"list", "discount", "status"}]
+            for owner in owner_ids:
+                telegram_request(token, "setMyCommands",
+                                 commands=json.dumps(BOT_COMMANDS + extra, ensure_ascii=False),
+                                 scope=json.dumps({"type": "chat", "chat_id": int(owner)}))
+        logging.info("Меню команд Telegram обновлено")
+    except (requests.RequestException, ValueError) as error:
         logging.warning("Не удалось обновить меню команд: %s", safe_error(error))
 
 
@@ -937,17 +961,26 @@ def update_chat_id(update: dict) -> str:
     return str(message.get("chat", {}).get("id", ""))
 
 
-def handle_update(token: str, storage: Storage, update: dict, allowed_chat_id: str) -> None:
-    # Бот отвечает только владельцу. Без этой проверки любой, кто узнал его
-    # username, мог отправить /favorites и увидеть чужое избранное с заметками
-    # или поставить мониторинг на паузу через /start.
+def handle_update(token: str, storage: Storage, update: dict, allowed_chat_id: str,
+                  config: dict | None = None) -> None:
+    import olx_feed
+    # Владельческие команды — только владельцу. Без этой проверки любой, кто
+    # узнал username бота, мог отправить /favorites и увидеть чужое избранное
+    # с заметками или поставить мониторинг на паузу через /start.
+    # Посторонним доступен лишь публичный режим (свои поиски по ссылкам),
+    # и то если он включён в config.yaml.
+    owner_ids = {cid.strip() for cid in str(allowed_chat_id).split(",")}
     sender = update_chat_id(update)
-    if sender and sender not in {cid.strip() for cid in str(allowed_chat_id).split(",")}:
-        logging.warning("Проигнорировано сообщение из чужого чата %s", sender)
+    if sender and sender not in owner_ids:
+        if not olx_feed.handle_public_update(token, storage.connection, update, config, owner_ids):
+            logging.warning("Проигнорировано сообщение из чужого чата %s", sender)
         return
     callback = update.get("callback_query")
     if callback:
         action, _, payload = callback.get("data", "").partition(":")
+        if action == "f":
+            olx_feed.handle_public_update(token, storage.connection, update, config, owner_ids)
+            return
         if action in {"m", "p"}:
             chat_id = callback["message"]["chat"]["id"]
             if action == "m" and payload == "pause":
@@ -1012,6 +1045,10 @@ def handle_update(token: str, storage: Storage, update: dict, allowed_chat_id: s
         storage.connection.execute("DELETE FROM meta WHERE key=?", (f"pending_note:{chat_id}",)); storage.connection.commit()
         telegram_request(token, "sendMessage", chat_id=chat_id, text="Заметка сохранена.")
         return
+    if olx_feed.handle_admin_command(token, storage.connection, message):
+        return
+    if olx_feed.handle_public_update(token, storage.connection, update, config, owner_ids):
+        return
     command = message_text.split("@", 1)[0].lower()
     if command in {"/favorites", "/избранное"}:
         telegram_request(token, "sendMessage", chat_id=message["chat"]["id"], text=favorite_text(storage), parse_mode="HTML", disable_web_page_preview=True)
@@ -1050,7 +1087,7 @@ def profiles_menu(storage: Storage) -> dict:
     return {"inline_keyboard": buttons}
 
 
-def telegram_listener(token: str, chat_id: str, stop: threading.Event) -> None:
+def telegram_listener(token: str, chat_id: str, stop: threading.Event, config: dict | None = None) -> None:
     storage = Storage()
     try:
         while not stop.is_set():
@@ -1063,7 +1100,7 @@ def telegram_listener(token: str, chat_id: str, stop: threading.Event) -> None:
                 response.raise_for_status()
                 for update in response.json().get("result", []):
                     try:
-                        handle_update(token, storage, update, chat_id)
+                        handle_update(token, storage, update, chat_id, config)
                     except requests.RequestException as error:
                         # У callback_query есть короткий срок жизни. Старое нажатие
                         # уже нельзя подтвердить, но оно не должно зацикливать очередь.
@@ -1223,9 +1260,18 @@ def main(debug_count: int | None = None) -> None:
     session = olx_session()
     max_pages, page_delay = int(config.get("max_pages_per_search", 0)), float(config.get("page_delay_seconds", 1))
     stop = threading.Event()
-    threading.Thread(target=telegram_listener, args=(token, chat_id, stop), daemon=True, name="telegram-listener").start()
+    threading.Thread(target=telegram_listener, args=(token, chat_id, stop, config), daemon=True, name="telegram-listener").start()
     threading.Thread(target=daily_summary_loop, args=(token, chat_id, config, stop), daemon=True, name="daily-summary").start()
-    register_commands(token)
+    import olx_feed
+    owner_ids = {cid.strip() for cid in chat_id.split(",")}
+    public = bool(olx_feed.settings(config)["enabled"])
+    if public:
+        # Отдельный поток: публичные выдачи опрашиваются раз в пару минут,
+        # а полный обход видеокарт занимает куда дольше и шёл бы помехой.
+        threading.Thread(target=olx_feed.feed_loop, args=(token, config, owner_ids, stop),
+                         daemon=True, name="public-feed").start()
+        logging.info("Публичный режим включён")
+    register_commands(token, owner_ids, public)
     logging.info("Помощник запущен: обход раз в %s сек.; команды Telegram по «/»", config["poll_interval_seconds"])
     try:
         while True:
