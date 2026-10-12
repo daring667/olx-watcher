@@ -7,6 +7,8 @@ Wants=network-online.target
 Type=simple
 User={{RUN_USER}}
 WorkingDirectory={{PROJECT_DIR}}
+# Новые файлы (база, WAL, бэкапы) — только для владельца: там токены и оплаты.
+UMask=0077
 ExecStart={{PROJECT_DIR}}/venv/bin/python olx_mail.py --interval 180
 Restart=on-failure
 RestartSec=30

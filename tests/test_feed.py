@@ -443,3 +443,101 @@ def test_all_callback_data_fits_telegram_limit(bot):
 def test_public_commands_match_telegram_rules(entry):
     import re
     assert re.fullmatch(r"[a-z0-9_]{1,32}", entry["command"])
+
+
+# --- Безопасность -------------------------------------------------------------
+def test_flood_is_ignored_after_limit(bot):
+    storage, _, calls = bot
+    for _ in range(olx_feed.FLOOD_LIMIT + 5):
+        say(storage, 777, "привет")
+    assert len(texts(calls)) == olx_feed.FLOOD_LIMIT
+
+
+def test_owner_is_never_rate_limited(bot):
+    storage, _, calls = bot
+    for _ in range(olx_feed.FLOOD_LIMIT + 5):
+        say(storage, OWNER, "/start")
+    assert len(texts(calls)) == olx_feed.FLOOD_LIMIT + 5
+
+
+def test_second_receipt_while_pending_is_not_forwarded(bot):
+    storage, db, calls = bot
+    say(storage, 777, "/start")
+    say(storage, 777, photo=[{"file_id": "a"}])
+    say(storage, 777, photo=[{"file_id": "b"}])
+    assert sum(method == "forwardMessage" for method, _ in calls) == 1
+    assert "уже на проверке" in texts(calls)[-1]
+    assert len(db.pending_payments()) == 1
+
+
+def test_receipts_per_day_cap(bot):
+    storage, db, calls = bot
+    say(storage, 777, "/start")
+    for _ in range(olx_feed.RECEIPTS_PER_DAY + 1):
+        say(storage, 777, photo=[{"file_id": "x"}])
+        for p in db.pending_payments():
+            db.reject_payment(p["id"], OWNER)
+    assert sum(method == "forwardMessage" for method, _ in calls) == olx_feed.RECEIPTS_PER_DAY
+
+
+def test_delete_my_data(bot):
+    storage, db, calls = bot
+    say(storage, 777, SEARCH)
+    say(storage, 888, SEARCH)
+    say(storage, 777, photo=[{"file_id": "x"}])
+    press(storage, OWNER, f"a:ok:{db.pending_payments()[0]['id']}")
+    say(storage, 777, "/deleteme")
+    assert "Удалить мои данные" in texts(calls)[-1]
+    press(storage, 777, "u:delok")
+    assert db.user("777") is None and db.watches("777") == []
+    assert len(db.watches("888")) == 1                      # чужое не тронуто
+    assert db.stats()["revenue_total"] == 5000  # выручка осталась (цена из CONFIG теста)
+    assert db.c.execute("SELECT COUNT(*) FROM payments WHERE chat_id='777'").fetchone()[0] == 0
+    # Вернулся — пробного периода второй раз нет.
+    say(storage, 777, "/start")
+    assert not olx_feed.is_active(db.user("777"), {OWNER})
+
+
+def test_telegram_429_is_retried_once(monkeypatch):
+    responses = [
+        {"ok": False, "error_code": 429, "description": "Too Many Requests", "parameters": {"retry_after": 3}},
+        {"ok": True, "result": {"message_id": 5}},
+    ]
+    slept = []
+
+    class Response:
+        def __init__(self, body):
+            self.body, self.status_code = body, 200 if body["ok"] else 429
+
+        def json(self):
+            return self.body
+
+    monkeypatch.setattr(olx_watcher.requests, "post", lambda *a, **kw: Response(responses.pop(0)))
+    monkeypatch.setattr(olx_watcher.time, "sleep", slept.append)
+    assert olx_watcher.telegram_request("t", "sendMessage", chat_id=1, text="x")["result"]["message_id"] == 5
+    assert slept == [3]
+
+
+def test_olx_block_backoff():
+    assert [olx_feed.next_backoff(b, True) for b in (0, 2, 4, 32, 60)] == [2, 4, 8, 60, 60]
+    assert olx_feed.next_backoff(16, False) == 0
+    assert olx_feed.is_olx_block(Exception("HTTP Error 403: Forbidden"))
+    assert not olx_feed.is_olx_block(Exception("Connection reset"))
+
+
+def test_healthcheck_feed_staleness(bot):
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "deploy"))
+    import healthcheck
+
+    storage, db, _ = bot
+    assert healthcheck.feed_problems(db.c, {OWNER}) == []
+    say(storage, 777, SEARCH)
+    url = db.watches("777")[0]["search_url"]
+    db.mark_polled(url)
+    assert healthcheck.feed_problems(db.c, {OWNER}) == []
+    db.c.execute("UPDATE feed_urls SET last_polled=?", (int(time.time()) - 3600,))
+    assert "не опрашивался" in healthcheck.feed_problems(db.c, {OWNER})[0]
+    db.set_user("777", paid_until=1)  # у всех истёк доступ — опрос и не должен идти
+    assert healthcheck.feed_problems(db.c, {OWNER}) == []

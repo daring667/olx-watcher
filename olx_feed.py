@@ -25,6 +25,7 @@ import os
 import re
 import threading
 import time
+from collections import defaultdict, deque
 from datetime import datetime
 from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
@@ -74,6 +75,28 @@ CITIES = {
 # Разделы сайта, которые не являются выдачей объявлений.
 NOT_LISTING = {"obyavlenie", "myaccount", "account", "adding", "favorites", "chat", "help",
                "oferta", "login", "register", "payments", "messages"}
+
+# Защита от флуда: больше FLOOD_LIMIT сообщений и нажатий за FLOOD_WINDOW
+# секунд от одного чата бот молча пропускает. Иначе один человек мог бы
+# упереть бота в лимиты Telegram (429), и уведомления опоздали бы у всех.
+FLOOD_LIMIT, FLOOD_WINDOW = 20, 60
+_recent: dict[str, deque] = defaultdict(deque)
+
+
+def flooding(chat_id: str, limit: int = FLOOD_LIMIT, window: int = FLOOD_WINDOW) -> bool:
+    now_ts = time.monotonic()
+    hits = _recent[chat_id]
+    while hits and now_ts - hits[0] > window:
+        hits.popleft()
+    if len(hits) >= limit:
+        return True
+    hits.append(now_ts)
+    return False
+
+
+# Чеки: один на проверке за раз и не больше трёх в сутки — каждый чек
+# пересылается владельцу, и без лимита им можно было заспамить личку.
+RECEIPTS_PER_DAY = 3
 
 PUBLIC_COMMANDS = [
     {"command": "start", "description": "Главное меню"},
@@ -321,16 +344,34 @@ def notify_access(db: FeedDB, token: str, cfg: dict, owner_ids: set[str]) -> Non
         db.log(user["chat_id"], "expired")
 
 
+def is_olx_block(error: Exception) -> bool:
+    """403/429 от OLX — не сбой сети, а ограничение: долбить дальше нельзя."""
+    status = getattr(getattr(error, "response", None), "status_code", None)
+    return status in {403, 429} or any(code in str(error) for code in (" 403", " 429"))
+
+
+def next_backoff(current: int, blocked: bool) -> int:
+    """Пауза в минутах: 2 → 4 → 8 … до 60 при блокировках подряд, 0 после успеха."""
+    return min(60, current * 2 if current else 2) if blocked else 0
+
+
+def notify_owners(db: FeedDB, token: str, owner_ids: set[str], text: str) -> None:
+    for owner in owner_ids:
+        safe_send(db, token, owner, text)
+
+
 def feed_loop(token: str, config: dict, owner_ids: set[str], stop: threading.Event) -> None:
     cfg = settings(config)
     storage = w.Storage()
     db = FeedDB(storage.connection)
     session = make_session(cfg["proxy"])
+    backoff = 0  # минут паузы после блокировки OLX; 0 — работаем как обычно
     try:
         while not stop.is_set():
             started = time.monotonic()
             urls = db.polled_urls()
             sent = polled = 0
+            blocked = False
             for search_url in urls:
                 if stop.is_set():
                     break
@@ -342,6 +383,9 @@ def feed_loop(token: str, config: dict, owner_ids: set[str], stop: threading.Eve
                 except w.NETWORK_ERRORS as error:
                     storage.record_error("Публичный поиск OLX", error)
                     logging.warning("Публичный поиск: %s — %s", search_url, error)
+                    if is_olx_block(error):
+                        blocked = True
+                        break  # остальные выдачи сейчас тоже не откроются — не злим OLX дальше
                 except Exception as error:
                     storage.record_error("Публичный поиск", error)
                     logging.exception("Публичный поиск: ошибка %s", search_url)
@@ -353,6 +397,15 @@ def feed_loop(token: str, config: dict, owner_ids: set[str], stop: threading.Eve
             if polled:
                 logging.info("Публичный поиск: выдач %d, отправлено %d, %.1f сек.",
                              polled, sent, time.monotonic() - started)
+            backoff = next_backoff(backoff, blocked)
+            if blocked:
+                logging.warning("OLX ограничил запросы — пауза %d мин.", backoff)
+                if backoff == 2:  # первая блокировка подряд — сообщаем один раз
+                    notify_owners(db, token, owner_ids,
+                                  "⚠️ <b>OLX ограничил запросы</b> с сервера. Делаю паузу и повторяю всё реже "
+                                  "(до часа). Если повторяется — увеличьте feed.poll_seconds или задайте feed.proxy.")
+                stop.wait(backoff * 60)
+                continue
             stop.wait(max(5.0, float(cfg["poll_seconds"]) - (time.monotonic() - started)))
     finally:
         storage.close()
@@ -530,6 +583,12 @@ def sub_screen(db: FeedDB, user, cfg: dict, owner_ids: set[str]) -> tuple[str, s
     return text, markup([button("📸 Я оплатил — отправить чек", "u:paid")], [HOME])
 
 
+def delete_screen() -> tuple[str, str]:
+    return ("🗑 <b>Удалить мои данные?</b>\n\nСотрутся поиски, избранное, история присланных объявлений "
+            "и профиль. Оплаченный доступ не сохранится. Отменить это нельзя.",
+            markup([button("🗑 Да, удалить всё", "u:delok")], [button("⬅️ Отмена", "u:home")]))
+
+
 def help_screen(cfg: dict) -> tuple[str, str]:
     return (f"❓ <b>Как работает {html.escape(cfg['brand'])}</b>\n\n"
             "1. Вы присылаете ссылку на поиск OLX со своими фильтрами.\n"
@@ -540,8 +599,9 @@ def help_screen(cfg: dict) -> tuple[str, str]:
             "<b>Полезное</b>\n"
             "• ⭐ под объявлением — сохранить в избранное.\n"
             "• ⏸ под объявлением — поставить поиск на паузу.\n"
-            "• 🎯 Фильтр выгоды — присылать только то, что заметно дешевле рынка.",
-            markup([button("➕ Добавить поиск", "u:add")], [HOME]))
+            "• 🎯 Фильтр выгоды — присылать только то, что заметно дешевле рынка.\n\n"
+            "Независимый сервис, не связан с OLX. Свои данные можно удалить в любой момент.",
+            markup([button("➕ Добавить поиск", "u:add")], [button("🗑 Удалить мои данные", "u:del"), HOME]))
 
 
 # --- Действия пользователя ----------------------------------------------------
@@ -581,6 +641,14 @@ def add_watch(token: str, db: FeedDB, user, text: str, cfg: dict, owner_ids: set
 
 def handle_receipt(token: str, db: FeedDB, user, chat: dict, message: dict, cfg: dict, owner_ids: set[str]) -> None:
     """Чек об оплате: в базу как ожидающий, владельцу — с кнопками решения."""
+    if any(p["status"] == "pending" for p in db.payments_of(user["chat_id"])):
+        send(token, user["chat_id"], "⏳ Ваш чек уже на проверке — я напишу, как только доступ продлят.",
+             reply_markup=markup([HOME]))
+        return
+    if db.receipts_since(user["chat_id"], int(time.time()) - DAY) >= RECEIPTS_PER_DAY:
+        send(token, user["chat_id"], "Слишком много чеков за сутки. Если что-то не так — попробуйте завтра.",
+             reply_markup=markup([HOME]))
+        return
     photo = (message.get("photo") or [{}])[-1].get("file_id") or (message.get("document") or {}).get("file_id")
     payment_id = db.create_receipt(user["chat_id"], photo)
     db.set_user(user["chat_id"], state="", state_data="")
@@ -684,6 +752,13 @@ def handle_user_callback(token: str, db: FeedDB, user, callback: dict, verb: str
                               markup([button("⬅️ Отмена", "u:sub")])), message)
     elif verb == "help":
         show(token, chat_id, help_screen(cfg), message)
+    elif verb == "del":
+        show(token, chat_id, delete_screen(), message)
+    elif verb == "delok":
+        db.delete_user(chat_id)
+        show(token, chat_id, ("🗑 <b>Ваши данные удалены.</b>\nПоиски, избранное и история стёрты. "
+                              "Если захотите вернуться — просто напишите /start.", markup()), message)
+        return "Данные удалены"
     elif verb == "gpu" and chat_id in owner_ids:
         show(token, chat_id, ("🎮 <b>Видеокарты</b> — панель управления",
                               json.dumps(w.main_menu(storage_setting), ensure_ascii=False)), message)
@@ -882,6 +957,8 @@ def handle_public_update(token: str, connection, update: dict, config: dict | No
         if prefix not in {"f", "u", "a"}:
             return False
         chat = callback["message"]["chat"]
+        if str(chat["id"]) not in owner_ids and flooding(str(chat["id"])):
+            return True
         user, _ = db.touch_user({**chat, **(callback.get("from") or {}), "id": chat["id"]}, trial)
         verb, _, arg = payload.partition(":")
         answer = ""
@@ -909,9 +986,11 @@ def handle_public_update(token: str, connection, update: dict, config: dict | No
         return False
     chat_id = str(chat["id"])
     is_owner = chat_id in owner_ids
+    if not is_owner and flooding(chat_id):
+        return True
     text = (message.get("text") or message.get("caption") or "").strip()
     command = text.split()[0].split("@", 1)[0].lower() if text.startswith("/") else ""
-    public = {"/start", "/menu", "/help", "/list", "/status", "/discount"}
+    public = {"/start", "/menu", "/help", "/list", "/status", "/discount", "/deleteme"}
     if command and command not in public:
         # Владелец — к своим командам; посторонний — тишина, даже без записи в базу.
         return False if is_owner else True
@@ -936,6 +1015,9 @@ def handle_public_update(token: str, connection, update: dict, config: dict | No
         return True
     if command == "/help":
         show(token, chat_id, help_screen(cfg))
+        return True
+    if command == "/deleteme":
+        show(token, chat_id, delete_screen())
         return True
     if command == "/list":
         show(token, chat_id, list_screen(db, user, cfg, owner_ids))

@@ -6,6 +6,8 @@ After=network.target
 Type=oneshot
 User={{RUN_USER}}
 WorkingDirectory={{PROJECT_DIR}}
+# Новые файлы (база, WAL, бэкапы) — только для владельца: там токены и оплаты.
+UMask=0077
 ExecStart={{PROJECT_DIR}}/venv/bin/python deploy/backup.py
 StandardOutput=journal
 StandardError=journal

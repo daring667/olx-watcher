@@ -129,3 +129,16 @@ def test_closed_service_lets_only_owner_in(client, monkeypatch):
     monkeypatch.setattr(miniapp, "context", lambda: ({"feed": {"enabled": False}}, TOKEN, {OWNER}))
     assert client.call("GET", "me").status_code == 403
     assert client.call("GET", "me", user_id=int(OWNER)).status_code == 200
+
+
+def test_delete_me(client):
+    client.call("POST", "watches", json_body={"query": "ps5", "city": "list"})
+    assert client.call("DELETE", "me").status_code == 200
+    db = miniapp.FeedDB(__import__("sqlite3").connect(olx_watcher.STATE_PATH))
+    assert db.watches("777") == []
+
+
+def test_api_rate_limit(client):
+    codes = [client.call("GET", "me").status_code for _ in range(95)]
+    assert codes.count(429) == 5
+    assert client.call("GET", "me", user_id=int(OWNER)).status_code == 200  # владельца не ограничиваем

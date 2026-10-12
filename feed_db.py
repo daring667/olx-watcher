@@ -14,6 +14,7 @@ TikTok-бота: остальной код вызывает методы с по
 """
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 import statistics
 import time
@@ -93,6 +94,10 @@ CREATE TABLE IF NOT EXISTS events (
   detail  TEXT NOT NULL DEFAULT '',
   at      INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS deleted_users (
+  chat_hash  TEXT PRIMARY KEY,                -- sha256 от chat_id, самого ID не храним
+  deleted_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS feed_ads (
   search_url TEXT NOT NULL, ad_id TEXT NOT NULL, title TEXT, price_kzt INTEGER,
   url TEXT, first_seen INTEGER NOT NULL, PRIMARY KEY(search_url, ad_id)
@@ -130,6 +135,10 @@ def now() -> int:
     return int(time.time())
 
 
+def chat_hash(chat_id) -> str:
+    return hashlib.sha256(f"olx-radar:{chat_id}".encode()).hexdigest()
+
+
 class FeedDB:
     def __init__(self, connection: sqlite3.Connection) -> None:
         self.c = connection
@@ -165,11 +174,14 @@ class FeedDB:
         флаг blocked: раз человек пишет боту, значит, он его разблокировал.
         """
         chat_id, t = str(chat.get("id")), now()
+        # Удалившему свои данные пробный период второй раз не положен: иначе
+        # «удалиться и зайти заново» превращалось бы в бесконечный бесплатный доступ.
+        trial = 0 if self._one("SELECT 1 FROM deleted_users WHERE chat_hash=?", (chat_hash(chat_id),)) else trial_days
         created = self._write(
             "INSERT OR IGNORE INTO users(chat_id,username,first_name,last_name,language_code,"
             "joined_at,last_seen_at,paid_until) VALUES(?,?,?,?,?,?,?,?)",
             (chat_id, chat.get("username"), chat.get("first_name"), chat.get("last_name"),
-             chat.get("language_code"), t, t, t + trial_days * DAY)).rowcount == 1
+             chat.get("language_code"), t, t, t + trial * DAY)).rowcount == 1
         self._write(
             "UPDATE users SET username=COALESCE(?,username), first_name=COALESCE(?,first_name), "
             "last_name=COALESCE(?,last_name), last_seen_at=?, blocked=0 WHERE chat_id=?",
@@ -181,6 +193,27 @@ class FeedDB:
     def set_user(self, chat_id, **fields) -> None:
         columns = ", ".join(f"{name}=?" for name in fields)
         self._write(f"UPDATE users SET {columns} WHERE chat_id=?", (*fields.values(), str(chat_id)))
+
+    def delete_user(self, chat_id) -> None:
+        """«Удалить мои данные»: всё личное стирается, оплаты обезличиваются.
+
+        Оплаты не удаляются целиком — по ним считается выручка, — но в них не
+        остаётся ни ID, ни чека. Остаётся только хеш ID, чтобы не выдавать
+        пробный период повторно.
+        """
+        chat_id = str(chat_id)
+        for table in ("watches", "favorites", "deliveries", "events"):
+            self.c.execute(f"DELETE FROM {table} WHERE chat_id=?", (chat_id,))
+        self.c.execute("UPDATE payments SET chat_id='deleted', receipt_file=NULL, decided_by=NULL "
+                       "WHERE chat_id=?", (chat_id,))
+        self.c.execute("DELETE FROM users WHERE chat_id=?", (chat_id,))
+        self.c.execute("INSERT OR REPLACE INTO deleted_users(chat_hash,deleted_at) VALUES(?,?)",
+                       (chat_hash(chat_id), now()))
+        self.c.commit()
+
+    def receipts_since(self, chat_id, since: int) -> int:
+        return self._one("SELECT COUNT(*) FROM payments WHERE chat_id=? AND method='receipt' AND created_at>=?",
+                         (str(chat_id), since))[0]
 
     def find_user(self, target: str) -> sqlite3.Row | None:
         target = target.strip()

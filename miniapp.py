@@ -104,6 +104,10 @@ def authenticate():
     g.owner = g.user["chat_id"] in owner_ids
     if not g.cfg["enabled"] and not g.owner:
         return jsonify(error="Сервис пока закрыт"), 403
+    # Лимит на пользователя: приложение открыто в интернет, и подписанный
+    # initData не мешает долбить API в цикле.
+    if not g.owner and feed.flooding("app:" + g.user["chat_id"], limit=90, window=60):
+        return jsonify(error="Слишком много запросов — подождите минуту"), 429
     return None
 
 
@@ -265,6 +269,13 @@ def toggle_favorite(delivery_id: int):
 def delete_favorite(favorite_id: int):
     if not g.db.delete_favorite(favorite_id, g.user["chat_id"]):
         return error("Не найдено", 404)
+    return jsonify(ok=True)
+
+
+@app.delete("/api/me")
+def delete_me():
+    """«Удалить мои данные» из профиля приложения."""
+    g.db.delete_user(g.user["chat_id"])
     return jsonify(ok=True)
 
 

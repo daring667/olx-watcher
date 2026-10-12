@@ -626,7 +626,7 @@ class Storage:
         self.connection.commit()
 
 
-def telegram_request(token: str, method: str, **data: object) -> dict:
+def telegram_request(token: str, method: str, _retry: bool = True, **data: object) -> dict:
     response = requests.post(f"https://api.telegram.org/bot{token}/{method}", data=data, timeout=35)
     # Описание ошибки Telegram отдаёт в теле и при 4xx. raise_for_status() его
     # терял: «message is not modified» и «bot was blocked by the user»
@@ -637,6 +637,13 @@ def telegram_request(token: str, method: str, **data: object) -> dict:
         response.raise_for_status()
         raise
     if not result.get("ok"):
+        # 429 — Telegram просит подождать (всплеск рассылки или уведомлений).
+        # Один повтор после паузы, но не дольше 30 секунд: длиннее держать
+        # поток опроса нельзя, лучше пропустить одно сообщение.
+        retry_after = (result.get("parameters") or {}).get("retry_after")
+        if response.status_code == 429 and retry_after and _retry:
+            time.sleep(min(int(retry_after), 30))
+            return telegram_request(token, method, _retry=False, **data)
         raise requests.RequestException(
             f"{response.status_code}: {result.get('description', 'Ошибка Telegram API')}")
     return result

@@ -1,0 +1,13 @@
+[Unit]
+Description=Radar healthcheck (alerts the owner in Telegram)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User={{RUN_USER}}
+WorkingDirectory={{PROJECT_DIR}}
+UMask=0077
+ExecStart={{PROJECT_DIR}}/venv/bin/python deploy/healthcheck.py
+SyslogIdentifier=olx-monitor
+# Код 1 значит «нашли проблему и сообщили» — это не сбой самого монитора.
+SuccessExitStatus=1
