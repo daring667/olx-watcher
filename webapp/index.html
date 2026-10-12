@@ -401,8 +401,11 @@ function adRow(ad, onStar) {
       : h("div", { class: "noimg" }, "📦"),
     h("div", { class: "grow" },
       h("div", { class: "clamp" }, ad.title || "Объявление"),
-      h("div", { class: "price" }, ad.price != null ? money(ad.price) : "цена не указана"),
-      h("div", { class: "meta" }, discountPill(ad.discount), h("span", {}, ago(ad.at)))),
+      h("div", { class: "price" }, ad.old_price ? h("s", { class: "hint", style: "font-weight:400;margin-right:6px" }, money(ad.old_price)) : null,
+        ad.price != null ? money(ad.price) : "цена не указана"),
+      h("div", { class: "meta" }, ad.gone ? h("span", { class: "pill bad" }, "🚫 снято") : null,
+        ad.old_price ? h("span", { class: "pill good" }, "📉 подешевело") : null,
+        discountPill(ad.discount), h("span", {}, ago(ad.at)))),
     star);
 }
 async function feed() {

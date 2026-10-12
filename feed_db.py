@@ -86,6 +86,9 @@ CREATE TABLE IF NOT EXISTS favorites (
   url        TEXT,
   image_url  TEXT,
   saved_at   INTEGER NOT NULL,
+  current_price INTEGER,                      -- последняя проверенная цена
+  checked_at INTEGER,
+  gone       INTEGER NOT NULL DEFAULT 0,      -- объявление снято с OLX
   UNIQUE(chat_id, ad_id)
 );
 CREATE TABLE IF NOT EXISTS events (
@@ -124,6 +127,9 @@ MIGRATIONS = {
         "expiring_notified": "INTEGER NOT NULL DEFAULT 0",
         "state": "TEXT NOT NULL DEFAULT ''", "state_data": "TEXT NOT NULL DEFAULT ''",
         "admin_note": "TEXT NOT NULL DEFAULT ''",
+    },
+    "favorites": {
+        "current_price": "INTEGER", "checked_at": "INTEGER", "gone": "INTEGER NOT NULL DEFAULT 0",
     },
     "watches": {
         "paused": "INTEGER NOT NULL DEFAULT 0", "sent_count": "INTEGER NOT NULL DEFAULT 0",
@@ -414,6 +420,29 @@ class FeedDB:
 
     def remove_favorite_ad(self, chat_id, ad_id: str) -> bool:
         return bool(self._write("DELETE FROM favorites WHERE chat_id=? AND ad_id=?", (str(chat_id), ad_id)).rowcount)
+
+    def favorites_to_check(self, older_than: int, limit: int) -> list[sqlite3.Row]:
+        """Объявления из избранного, которые давно не перепроверяли (по одному на ad_id)."""
+        return self._all(
+            "SELECT ad_id, MAX(url) url, MAX(title) title FROM favorites WHERE gone=0 "
+            "GROUP BY ad_id HAVING MAX(COALESCE(checked_at, 0)) < ? ORDER BY MIN(COALESCE(checked_at, 0)) LIMIT ?",
+            (now() - older_than, limit))
+
+    def update_favorite_price(self, ad_id: str, price: int | None, gone: bool) -> list[dict]:
+        """Записывает проверку; возвращает, кого уведомить: [{chat_id, title, url, old, new, gone}]."""
+        changes = []
+        for row in self._all("SELECT * FROM favorites WHERE ad_id=? AND gone=0", (ad_id,)):
+            old = row["current_price"] if row["current_price"] is not None else row["price_kzt"]
+            if gone:
+                changes.append({"chat_id": row["chat_id"], "title": row["title"], "url": row["url"],
+                                "old": old, "new": None, "gone": True})
+            elif price is not None and old is not None and price < old:
+                changes.append({"chat_id": row["chat_id"], "title": row["title"], "url": row["url"],
+                                "old": old, "new": price, "gone": False})
+        self.c.execute("UPDATE favorites SET checked_at=?, gone=?, current_price=COALESCE(?, current_price) "
+                       "WHERE ad_id=?", (now(), int(gone), price, ad_id))
+        self.c.commit()
+        return changes
 
     def favorites(self, chat_id, limit: int = 20) -> list[sqlite3.Row]:
         return self._all("SELECT * FROM favorites WHERE chat_id=? ORDER BY saved_at DESC LIMIT ?",

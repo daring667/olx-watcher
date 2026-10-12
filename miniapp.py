@@ -148,7 +148,10 @@ def watch_json(row) -> dict:
 
 def ad_json(row) -> dict:
     keys = row.keys()
-    return {"id": row["id"], "ad_id": row["ad_id"], "title": row["title"], "price": row["price_kzt"],
+    current = row["current_price"] if "current_price" in keys and row["current_price"] is not None else row["price_kzt"]
+    return {"id": row["id"], "ad_id": row["ad_id"], "title": row["title"], "price": current,
+            "old_price": row["price_kzt"] if current is not None and row["price_kzt"] and current < row["price_kzt"] else None,
+            "gone": bool(row["gone"]) if "gone" in keys else False,
             "url": row["url"], "image": row["image_url"],
             "discount": row["discount_pct"] if "discount_pct" in keys else None,
             "at": row["sent_at"] if "sent_at" in keys else row["saved_at"],

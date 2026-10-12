@@ -364,6 +364,38 @@ def notify_owners(db: FeedDB, token: str, owner_ids: set[str], text: str) -> Non
         safe_send(db, token, owner, text)
 
 
+FAVORITE_RECHECK = 6 * 3600   # как часто перепроверять избранное объявление
+FAVORITES_PER_CYCLE = 10      # не больше стольких страниц объявлений за проход
+
+
+def check_favorites(db: FeedDB, session, token: str) -> int:
+    """Перепроверяет избранное: подешевело — пишем, снято — пишем. Возвращает число уведомлений."""
+    sent = 0
+    for row in db.favorites_to_check(FAVORITE_RECHECK, FAVORITES_PER_CYCLE):
+        price, gone = None, False
+        try:
+            price = w.fetch_details(session, w.Listing(row["ad_id"], row["url"], row["title"] or "", None)).price_kzt
+        except w.NETWORK_ERRORS as error:
+            status = getattr(getattr(error, "response", None), "status_code", None)
+            if is_olx_block(error):
+                raise  # пусть feed_loop включит паузу
+            gone = status in {404, 410}
+            if not gone:
+                continue  # сетевой сбой — проверим в следующий раз
+        for change in db.update_favorite_price(row["ad_id"], price, gone):
+            title = html.escape((change["title"] or "Объявление")[:80])
+            if change["gone"]:
+                text = f"🚫 <b>Снято с публикации</b>\n{title}"
+            else:
+                text = (f"📉 <b>Подешевело объявление из избранного</b>\n{title}\n"
+                        f"<s>{money(change['old'])}</s> → <b>{money(change['new'])}</b>")
+            keyboard = markup([link("🔗 Открыть на OLX", change["url"])]) if change["url"] and not change["gone"] \
+                else markup([button("⭐ Избранное", "u:favs")])
+            sent += safe_send(db, token, change["chat_id"], text, reply_markup=keyboard)
+        time.sleep(1)  # бережём OLX: страницы объявлений тяжелее выдачи
+    return sent
+
+
 def feed_loop(token: str, config: dict, owner_ids: set[str], stop: threading.Event) -> None:
     cfg = settings(config)
     storage = w.Storage()
@@ -394,6 +426,14 @@ def feed_loop(token: str, config: dict, owner_ids: set[str], stop: threading.Eve
                     storage.record_error("Публичный поиск", error)
                     logging.exception("Публичный поиск: ошибка %s", search_url)
                 stop.wait(float(cfg["url_delay_seconds"]))
+            if not blocked:
+                try:
+                    check_favorites(db, session, token)
+                except w.NETWORK_ERRORS as error:
+                    blocked = is_olx_block(error)
+                    logging.warning("Избранное: %s", error)
+                except Exception:
+                    logging.exception("Избранное: ошибка перепроверки")
             try:
                 notify_access(db, token, cfg, owner_ids)
             except Exception:
@@ -558,8 +598,14 @@ def favorites_screen(db: FeedDB, user) -> tuple[str, str]:
                 "чтобы не потерять интересные варианты.", markup([HOME]))
     lines = [f"⭐ <b>Избранное</b> ({len(favorites)})\n"]
     for index, row in enumerate(favorites, 1):
+        current = row["current_price"] if row["current_price"] is not None else row["price_kzt"]
+        price = money(current)
+        if row["price_kzt"] and current is not None and current < row["price_kzt"]:
+            price = f"<s>{money(row['price_kzt'])}</s> 📉 {money(current)}"
+        if row["gone"]:
+            price += " · 🚫 снято"
         lines.append(f'{index}. <a href="{html.escape(row["url"] or "", quote=True)}">'
-                     f'{html.escape((row["title"] or "—")[:60])}</a> — {money(row["price_kzt"])}')
+                     f'{html.escape((row["title"] or "—")[:60])}</a> — {price}')
     deletes = [button(f"🗑 {i}", f"u:fd:{row['id']}") for i, row in enumerate(favorites, 1)]
     rows = [deletes[i:i + 5] for i in range(0, len(deletes), 5)]
     return "\n".join(lines) + "\n\nКнопки 🗑 — убрать из избранного.", markup(*rows, [HOME])

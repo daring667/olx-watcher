@@ -605,3 +605,55 @@ def test_exclude_words_via_bot(bot):
     assert "дисплей" in db.watch(watch_id)["exclude_words"]
     press(storage, 777, f"u:wxc:{watch_id}")
     assert db.watch(watch_id)["exclude_words"] == ""
+
+
+# --- Снижение цены в избранном ------------------------------------------------
+def favorite_setup(storage, db, monkeypatch):
+    url, pages, cfg = poll_setup(storage, db, monkeypatch)
+    olx_feed.poll_url(db, None, "token", url, cfg, {OWNER})
+    pages.append(pages[0] + [olx_watcher.Listing("NEW1", "https://olx.kz/n1", "iPhone 13", 90000)])
+    olx_feed.poll_url(db, None, "token", url, cfg, {OWNER})
+    delivery = db.recent_deliveries("777")[0]
+    db.add_favorite(delivery)
+    return delivery
+
+
+def test_price_drop_in_favorites_is_notified_once(bot, monkeypatch):
+    storage, db, calls = bot
+    favorite_setup(storage, db, monkeypatch)
+    prices = [80000]
+    monkeypatch.setattr(olx_watcher, "fetch_details", lambda session, listing: listing.__class__(
+        listing.ad_id, listing.url, listing.title, prices[0]))
+    monkeypatch.setattr(olx_feed.time, "sleep", lambda s: None)
+    calls.clear()
+    assert olx_feed.check_favorites(db, None, "t") == 1
+    assert "90 000 ₸</s> → <b>80 000 ₸" in texts(calls)[-1]
+    # Сразу снова не проверяем (раз в 6 часов), а при той же цене — тишина.
+    assert olx_feed.check_favorites(db, None, "t") == 0
+    db.c.execute("UPDATE favorites SET checked_at=0"); db.c.commit()
+    assert olx_feed.check_favorites(db, None, "t") == 0
+    prices[0] = 95000  # подорожало — молчим, но запоминаем
+    db.c.execute("UPDATE favorites SET checked_at=0"); db.c.commit()
+    assert olx_feed.check_favorites(db, None, "t") == 0
+    assert db.favorites("777")[0]["current_price"] == 95000
+
+
+def test_removed_favorite_is_marked(bot, monkeypatch):
+    storage, db, calls = bot
+    favorite_setup(storage, db, monkeypatch)
+
+    class Gone(olx_watcher.requests.RequestException):
+        def __init__(self):
+            super().__init__("410 Gone")
+            self.response = type("R", (), {"status_code": 410})()
+
+    def gone(session, listing):
+        raise Gone()
+
+    monkeypatch.setattr(olx_watcher, "fetch_details", gone)
+    monkeypatch.setattr(olx_feed.time, "sleep", lambda s: None)
+    assert olx_feed.check_favorites(db, None, "t") == 1
+    assert db.favorites("777")[0]["gone"] == 1
+    assert "Снято с публикации" in texts(calls)[-1]
+    press(storage, 777, "u:favs")
+    assert "снято" in texts(calls)[-1]
