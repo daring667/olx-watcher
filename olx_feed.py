@@ -300,9 +300,12 @@ def category_names(soup, url: str) -> dict[str, str]:
         label = " ".join(w.text(heading).split(" - ")[0].split())
         # «Компьютеры и комплектующие Алматинская область» — раздел уже назван
         # выше, оставляем то, что добавил текущий уровень.
+        # Но «Работа в сфере IT» — цельное название, «в сфере IT» без начала не
+        # читается: режем, только если остаток — имя с большой буквы.
         for parent in sorted(names.values(), key=len, reverse=True):
-            if label.startswith(parent) and label != parent:
-                label = label[len(parent):].strip(" -–—")
+            rest = label[len(parent):].strip(" -–—") if label.startswith(parent) else ""
+            if rest and rest[0].isupper():
+                label = rest
                 break
         names[leaf[-1]] = label
     return names

@@ -916,3 +916,10 @@ def test_fetch_title_falls_back_when_olx_fails():
         def get(self, *a, **kw):
             raise olx_watcher.requests.RequestException("down")
     assert olx_feed.fetch_title(Broken(), "https://www.olx.kz/transport/legkovye-avtomobili/bmw/") == "legkovye-avtomobili · bmw"
+
+
+def test_heading_starting_with_parent_word_is_kept_whole():
+    from bs4 import BeautifulSoup
+    page = '<div data-testid="breadcrumbs"><a href="/rabota/">Работа</a></div><h1>Работа в сфере IT</h1>'
+    url = "https://www.olx.kz/rabota/internet-it-kompyutery-telekom/"
+    assert olx_feed.watch_title(url, olx_feed.category_names(BeautifulSoup(page, "html.parser"), url)) == "Работа · Работа в сфере IT"
