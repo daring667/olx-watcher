@@ -75,7 +75,7 @@ def test_dashboard_price_filter_survives_junk(query, tmp_path, monkeypatch):
     storage.close()
     monkeypatch.setattr(dashboard, "DB", tmp_path / "dash.sqlite3")
     client = dashboard.app.test_client()
-    assert client.get(f"/passed?{query}").status_code == 200
+    assert client.get(f"/gpu/passed?{query}").status_code == 200
 
 
 @pytest.mark.parametrize("entry", olx_watcher.BOT_COMMANDS)
