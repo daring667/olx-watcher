@@ -893,3 +893,26 @@ def test_parse_search_roundtrip():
     assert olx_feed.apply_filters(form["base"], 10000, 200000, "used") == url
     link = olx_feed.parse_search("https://www.olx.kz/transport/legkovye-avtomobili/bmw/?search%5Border%5D=created_at%3Adesc")
     assert link["mode"] == "link" and link["link"] == "https://www.olx.kz/transport/legkovye-avtomobili/bmw/"
+
+
+def test_category_names_from_olx_page():
+    from bs4 import BeautifulSoup
+    page = ('<div data-testid="breadcrumbs"><a href="/">Главная</a><a href="/elektronika/">Электроника</a>'
+            '<a href="/elektronika/kompyutery-i-komplektuyuschie/">Компьютеры и комплектующие</a>'
+            '<a href="/elektronika/kompyutery-i-komplektuyuschie/alm/">Компьютеры и комплектующие Алматинская область</a></div>'
+            '<h1>Компьютеры - Алматинская область - cmp 30hx</h1>')
+    url = "https://www.olx.kz/elektronika/kompyutery-i-komplektuyuschie/alm/q-cmp-30hx/"
+    names = olx_feed.category_names(BeautifulSoup(page, "html.parser"), url)
+    assert olx_feed.watch_title(url, names) == "«cmp 30hx» · Компьютеры и комплектующие · Алматинская область"
+    leaf = ('<div data-testid="breadcrumbs"><a href="/transport/">Транспорт</a>'
+            '<a href="/transport/legkovye-avtomobili/">Легковые автомобили</a></div><h1>Продажа BMW (БМВ)</h1>')
+    url = "https://www.olx.kz/transport/legkovye-avtomobili/bmw/"
+    assert olx_feed.watch_title(url, olx_feed.category_names(BeautifulSoup(leaf, "html.parser"), url)) == \
+        "Легковые автомобили · Продажа BMW (БМВ)"
+
+
+def test_fetch_title_falls_back_when_olx_fails():
+    class Broken:
+        def get(self, *a, **kw):
+            raise olx_watcher.requests.RequestException("down")
+    assert olx_feed.fetch_title(Broken(), "https://www.olx.kz/transport/legkovye-avtomobili/bmw/") == "legkovye-avtomobili · bmw"

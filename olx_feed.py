@@ -207,7 +207,7 @@ def preview(session, url: str, exclude: str = "") -> dict:
                            "url": normalize_search_url(merged)})
     prices = sorted(c.price_kzt for c in cards if c.price_kzt)
     return {
-        "url": url, "title": watch_title(url),
+        "url": url, "title": watch_title(url, category_names(soup, url)),
         "total": total if total is not None else len(cards),
         "median": prices[len(prices) // 2] if prices else None,
         "categories": categories[:12],
@@ -250,12 +250,17 @@ def urljoin_olx(href: str) -> str:
     return href if href.startswith("http") else "https://www.olx.kz" + href
 
 
-def watch_title(search_url: str) -> str:
-    """Короткое имя поиска для списка: «q: iphone 13 · Алматы»."""
+def watch_title(search_url: str, names: dict[str, str] | None = None) -> str:
+    """Короткое имя поиска: «iphone 13» · Легковые автомобили · Алматы.
+
+    names — русские названия разделов по их адресам (из category_names). Без
+    них остаются слова из ссылки («legkovye-avtomobili»).
+    """
+    names = names or {}
     parts = urlsplit(search_url)
     segments = [unquote(s) for s in parts.path.split("/") if s and s not in {"d", "list"}]
     words = [s[2:].replace("-", " ") for s in segments if s.startswith("q-")]
-    rest = [CITIES.get(s, s) for s in segments if not s.startswith("q-")]
+    rest = [names.get(s) or CITIES.get(s, s) for s in segments if not s.startswith("q-")]
     label = " · ".join((["«" + words[0] + "»"] if words else []) + rest[-2:])
     query = dict(parse_qsl(parts.query))
     low, high = query.get("search[filter_float_price:from]"), query.get("search[filter_float_price:to]")
@@ -269,6 +274,51 @@ def watch_title(search_url: str) -> str:
 
 
 # --- Доступ и даты ----------------------------------------------------------
+def category_names(soup, url: str) -> dict[str, str]:
+    """Русские названия разделов из страницы выдачи OLX.
+
+    Родительские разделы — в «хлебных крошках» («Транспорт › Легковые
+    автомобили»), сам раздел — в заголовке страницы («Продажа BMW (БМВ)»):
+    в крошках его нет, он текущий.
+    """
+    names: dict[str, str] = {}
+    previous = ""
+    for a in soup.select('[data-testid="breadcrumbs"] a[href], [data-cy="breadcrumbs"] a[href]'):
+        slug = [s for s in a["href"].split("/") if s][-1:] or [""]
+        label = " ".join(w.text(a).split())
+        if not slug[0] or not label or label == "Главная":
+            continue
+        # Регион OLX склеивает с разделом: «Компьютеры и комплектующие Алматинская
+        # область» или «… - Алматинская область». Оставляем только регион.
+        short = label[len(previous):].strip(" -–—") if previous and label.startswith(previous) else label
+        names[unquote(slug[0])] = short or label
+        previous = label
+    heading = soup.select_one("h1")
+    segments = [unquote(s) for s in urlsplit(url).path.split("/") if s and s not in {"d", "list"}]
+    leaf = [s for s in segments if not s.startswith("q-") and s not in CITIES and s not in names]
+    if heading and leaf:
+        label = " ".join(w.text(heading).split(" - ")[0].split())
+        # «Компьютеры и комплектующие Алматинская область» — раздел уже назван
+        # выше, оставляем то, что добавил текущий уровень.
+        for parent in sorted(names.values(), key=len, reverse=True):
+            if label.startswith(parent) and label != parent:
+                label = label[len(parent):].strip(" -–—")
+                break
+        names[leaf[-1]] = label
+    return names
+
+
+def fetch_title(session, url: str) -> str:
+    """Название поиска с русскими разделами; если OLX не ответил — по словам из ссылки."""
+    from bs4 import BeautifulSoup
+    try:
+        response = session.get(url, timeout=25)
+        response.raise_for_status()
+        return watch_title(url, category_names(BeautifulSoup(response.text, "html.parser"), url))
+    except Exception:
+        return watch_title(url)
+
+
 def is_active(user, owner_ids: set[str]) -> bool:
     if user is None:
         return False
@@ -863,7 +913,7 @@ def add_watch(token: str, db: FeedDB, user, text: str, cfg: dict, owner_ids: set
         send(token, chat_id, f"📋 Можно следить максимум за {limit} поисками. Удалите ненужный, "
                              "чтобы добавить новый.", reply_markup=markup([button("📋 Мои поиски", "u:list")], [HOME]))
         return
-    title = watch_title(search_url)
+    title = fetch_title(make_session(cfg["proxy"]), search_url)
     watch_id = db.add_watch(chat_id, search_url, title)
     if watch_id is None:
         existing = db.watch_by_url(chat_id, search_url)
