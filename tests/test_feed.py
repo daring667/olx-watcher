@@ -760,3 +760,33 @@ def test_refund_command(bot):
     assert any(method == "refundStarPayment" for method, _ in calls)
     assert db.payment_by_reference("ch9")["status"] == "refunded"
     assert paid_until - db.user("777")["paid_until"] == 30 * DAY
+
+
+def test_same_ad_from_two_searches_is_sent_once(bot, monkeypatch):
+    storage, db, calls = bot
+    say(storage, 777, "https://www.olx.kz/alma-ata/q-gtx-970/")
+    say(storage, 777, "https://www.olx.kz/alma-ata/q-videokarta/")
+    urls = [w["search_url"] for w in db.watches("777")]
+    old = [olx_watcher.Listing("OLD", "u", "старое", 30000)]
+    pages = {u: old for u in urls}
+    monkeypatch.setattr(olx_feed, "fetch_cards", lambda session, search_url, page=1: pages[search_url])
+    cfg = olx_feed.settings(CONFIG)
+    for u in urls:
+        olx_feed.poll_url(db, None, "t", u, cfg, {OWNER})
+    calls.clear()
+    card = olx_watcher.Listing("GTX", "https://olx.kz/g", "Видеокарта gtx 970", 35000)
+    for u in urls:
+        pages[u] = old + [card]
+        olx_feed.poll_url(db, None, "t", u, cfg, {OWNER})
+    assert sum(kw.get("chat_id") == "777" for method, kw in calls if method == "sendMessage") == 1
+
+
+@pytest.mark.parametrize("url, expected", [
+    ("https://frankfurt.apollo.olxcdn.com:443/v1/files/x-KZ/image;s=216x152;q=50",
+     "https://frankfurt.apollo.olxcdn.com:443/v1/files/x-KZ/image;s=1000x750;q=85"),
+    ("https://frankfurt.apollo.olxcdn.com/v1/files/x-KZ/image", "https://frankfurt.apollo.olxcdn.com/v1/files/x-KZ/image;s=1000x750;q=85"),
+    ("https://example.com/a.jpg", "https://example.com/a.jpg"),
+    (None, None),
+])
+def test_hd_image(url, expected):
+    assert olx_watcher.hd_image(url) == expected

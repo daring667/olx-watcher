@@ -115,6 +115,7 @@ CREATE TABLE IF NOT EXISTS feed_urls (
 CREATE INDEX IF NOT EXISTS feed_ads_market ON feed_ads(search_url, first_seen);
 CREATE INDEX IF NOT EXISTS watches_url ON watches(search_url);
 CREATE INDEX IF NOT EXISTS deliveries_chat ON deliveries(chat_id, sent_at);
+CREATE INDEX IF NOT EXISTS deliveries_ad ON deliveries(chat_id, ad_id);
 CREATE INDEX IF NOT EXISTS payments_status ON payments(status, created_at);
 CREATE INDEX IF NOT EXISTS events_kind ON events(kind, at);
 """
@@ -429,6 +430,11 @@ class FeedDB:
         self.c.execute("UPDATE watches SET sent_count=sent_count+1, last_sent_at=? WHERE id=?", (now(), watch_id))
         self.c.commit()
         return cursor.lastrowid
+
+    def delivered(self, chat_id, ad_id: str) -> bool:
+        """Это объявление этому человеку уже присылали (по любому из его поисков)."""
+        return self._one("SELECT 1 FROM deliveries WHERE chat_id=? AND ad_id=? LIMIT 1",
+                         (str(chat_id), ad_id)) is not None
 
     def delivery(self, delivery_id: int, chat_id) -> sqlite3.Row | None:
         return self._one("SELECT * FROM deliveries WHERE id=? AND chat_id=?", (delivery_id, str(chat_id)))

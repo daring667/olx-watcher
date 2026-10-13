@@ -103,6 +103,18 @@ def page_url(search_url: str, page_number: int) -> str:
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
 
 
+def hd_image(url: str | None) -> str | None:
+    """Крупная версия фото с OLX CDN.
+
+    В выдаче OLX отдаёт миниатюру «;s=216x152;q=50» — в Telegram она выглядела
+    пиксельной кашей. Размер задаётся прямо в адресе, и CDN отдаёт ту же
+    картинку в 1000 px (около 100 КБ). Чужие адреса не трогаем.
+    """
+    if not url or "olxcdn.com" not in url:
+        return url
+    return re.sub(r";s=\d+x\d+(;q=\d+)?", ";s=1000x750;q=85", url) if ";s=" in url else url + ";s=1000x750;q=85"
+
+
 def card_title(card, link) -> str:
     """OLX держит заголовок в отдельном h4; у ссылки-обёртки текста нет."""
     for selector in ("h4", "h6", "h5"):
@@ -130,7 +142,7 @@ def extract_listings(search_url: str, page: str, limit: int) -> list[Listing]:
         price_node = card.select_one('[data-testid="ad-price"]')
         found.setdefault(ad_id, Listing(
             ad_id, url, card_title(card, link),
-            extract_price(text(price_node or card)), image_url=(image.get("src") or image.get("data-src")) if image else None,
+            extract_price(text(price_node or card)), image_url=hd_image(image.get("src") or image.get("data-src")) if image else None,
             search_url=search_url,
         ))
         if len(found) >= limit:
