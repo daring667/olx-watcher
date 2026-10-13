@@ -1,8 +1,9 @@
 [Unit]
-Description=Daily OLX Watcher database backup
+Description=Hourly OLX Watcher database backup
 
 [Timer]
-OnCalendar=*-*-* 04:30:00
+# Раз в час: копия уходит на Google Диск (hourly/ — 48 ч, daily/ — 30 дн.).
+OnCalendar=hourly
 # Машина может быть выключена в назначенный час — тогда копия снимается сразу
 # после включения, а не пропускается до следующих суток.
 Persistent=true

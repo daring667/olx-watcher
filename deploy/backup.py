@@ -9,7 +9,13 @@
 включено). Там лежат пользователи и оплаты публичного режима — это главное,
 что нельзя потерять.
 
-Запускается systemd-таймером раз в сутки; можно и руками:
+Ещё каждая копия уходит на Google Диск через rclone (BACKUP_RCLONE_REMOTE в
+.env, например «gdrive:Радар — бэкапы базы»): в hourly/ — последние 48
+часов, в daily/ — по одной за сутки на 30 дней. Живую базу на Диск
+синхронизировать нельзя: файл, переписываемый ботом, приехал бы битым.
+
+Запускается systemd-таймером раз в час; в Telegram архив уходит раз в сутки.
+Можно и руками:
     ./venv/bin/python deploy/backup.py
 """
 from __future__ import annotations
@@ -17,6 +23,7 @@ from __future__ import annotations
 import gzip
 import os
 import shutil
+import subprocess
 import sqlite3
 import sys
 import tempfile
@@ -30,7 +37,9 @@ SOURCE = ROOT / "data" / "watcher.sqlite3"
 # Не внутри data/ и не внутри репозитория: смысл копии в том, чтобы пережить
 # порчу рабочего каталога, а не лежать с ним рядом.
 DESTINATION = ROOT.parent / "backups"
-KEEP = 14
+KEEP = 48           # локальных копий: при запуске раз в час это двое суток
+DRIVE_HOURLY_AGE = "48h"
+DRIVE_DAILY_AGE = "30d"
 
 
 def make_backup() -> Path:
@@ -89,7 +98,40 @@ def send_to_owner(target: Path, caption: str) -> bool:
     return sent
 
 
+def rclone(*args: str) -> bool:
+    try:
+        result = subprocess.run(["rclone", *args], capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        print(f"rclone не запустился: {error}")
+        return False
+    if result.returncode != 0:
+        print(f"rclone {args[0]}: {result.stderr.strip()[-300:]}")
+    return result.returncode == 0
+
+
+def upload_to_drive(target: Path, daily: bool) -> bool:
+    """Копия на Google Диск и чистка старых. Сбой не роняет бэкап — локальная копия уже есть."""
+    remote = os.environ.get("BACKUP_RCLONE_REMOTE", "").rstrip("/")
+    if not remote:
+        return False
+    ok = rclone("copyto", str(target), f"{remote}/hourly/{target.name}")
+    rclone("delete", f"{remote}/hourly", "--min-age", DRIVE_HOURLY_AGE)
+    if ok and daily:
+        ok = rclone("copyto", str(target), f"{remote}/daily/{target.name}")
+        rclone("delete", f"{remote}/daily", "--min-age", DRIVE_DAILY_AGE)
+    return ok
+
+
+def first_today() -> bool:
+    """Первая копия за сутки — её же шлём в Telegram и кладём в daily/."""
+    today = datetime.now().strftime("%Y%m%d")
+    return len(list(DESTINATION.glob(f"watcher-{today}-*.sqlite3.gz"))) == 1
+
+
 def main() -> None:
+    sys.path.insert(0, str(ROOT))
+    from olx_watcher import load_dotenv
+    load_dotenv(ROOT / ".env")
     if not SOURCE.exists():
         sys.exit(f"База не найдена: {SOURCE}")
     target = make_backup()
@@ -104,7 +146,10 @@ def main() -> None:
     print(f"Копия: {target} ({size:.0f} КБ, объявлений {ads}); удалено старых: {removed}")
     caption = (f"🗄 Бэкап базы {datetime.now():%d.%m.%Y}: пользователей {users}, оплат {paid}, "
                f"{size:.0f} КБ. Храните этот файл — из него восстанавливается всё.")
-    if send_to_owner(target, caption):
+    daily = first_today()
+    if upload_to_drive(target, daily):
+        print("Копия на Google Диске" + (" (и в daily/)" if daily else ""))
+    if daily and send_to_owner(target, caption):
         print("Архив отправлен владельцу в Telegram")
 
 
