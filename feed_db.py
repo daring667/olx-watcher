@@ -466,8 +466,10 @@ class FeedDB:
     def recent_deliveries(self, chat_id, limit: int = 50) -> list[sqlite3.Row]:
         """Лента: последние присланные объявления, с отметкой избранного."""
         return self._all(
-            "SELECT d.*, EXISTS(SELECT 1 FROM favorites f WHERE f.chat_id=d.chat_id AND f.ad_id=d.ad_id) favorite "
-            "FROM deliveries d WHERE d.chat_id=? ORDER BY d.sent_at DESC, d.id DESC LIMIT ?", (str(chat_id), limit))
+            "SELECT d.*, w.title watch_title, "
+            "EXISTS(SELECT 1 FROM favorites f WHERE f.chat_id=d.chat_id AND f.ad_id=d.ad_id) favorite "
+            "FROM deliveries d LEFT JOIN watches w ON w.id=d.watch_id "
+            "WHERE d.chat_id=? ORDER BY d.sent_at DESC, d.id DESC LIMIT ?", (str(chat_id), limit))
 
     def add_favorite(self, delivery: sqlite3.Row) -> bool:
         added = self._write(

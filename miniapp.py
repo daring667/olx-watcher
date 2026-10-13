@@ -155,7 +155,9 @@ def ad_json(row) -> dict:
             "url": row["url"], "image": row["image_url"],
             "discount": row["discount_pct"] if "discount_pct" in keys else None,
             "at": row["sent_at"] if "sent_at" in keys else row["saved_at"],
-            "favorite": bool(row["favorite"]) if "favorite" in keys else True}
+            "favorite": bool(row["favorite"]) if "favorite" in keys else True,
+            "watch_id": row["watch_id"] if "watch_id" in keys else None,
+            "watch_title": row["watch_title"] if "watch_title" in keys else None}
 
 
 def user_json(user) -> dict:
@@ -303,7 +305,9 @@ def update_settings():
 
 @app.get("/api/feed")
 def deliveries():
-    return jsonify(items=[ad_json(row) for row in g.db.recent_deliveries(g.user["chat_id"], 60)])
+    # Фильтры и сортировка ленты — на стороне приложения, поэтому отдаём с запасом.
+    limit = min(max(request.args.get("limit", 200, type=int), 1), 300)
+    return jsonify(items=[ad_json(row) for row in g.db.recent_deliveries(g.user["chat_id"], limit)])
 
 
 @app.get("/api/favorites")

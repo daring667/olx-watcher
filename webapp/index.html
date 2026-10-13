@@ -486,20 +486,105 @@ function adRow(ad, onStar) {
     star);
 }
 async function feed() {
-  loading();
-  const [{ items }, me] = await Promise.all([api("feed"), S.me ? S.me : loadMe()]);
-  const filter = me.user.min_discount ? "только от " + me.user.min_discount + "% дешевле рынка" : "все новые";
+  if (!S.feedItems) loading();
+  const [{ items }, me] = await Promise.all([api("feed"), loadMe()]);
+  S.feedItems = items;
+  // Фильтр живёт в S.feedFilter: при переходах по вкладкам выбранное не сбрасывается.
+  const F = S.feedFilter || (S.feedFilter = { watch: "", kind: "all", sort: "new", q: "" });
+  const list = h("div");
+  const counter = h("div", { class: "hint", style: "margin:4px 4px 8px" });
+
+  // --- Что присылать в Telegram (раньше было в профиле) ---
+  const sendSeg = h("div", { class: "seg", style: "margin-bottom:8px" }, me.filter_steps.map(step =>
+    h("button", { class: me.user.min_discount === step ? "on" : "", onclick: async e => {
+      if (me.user.min_discount === step) return;
+      tap();
+      await run(api("settings", { method: "POST", body: { min_discount: step } }), step ? "Буду присылать только от " + step + "% дешевле рынка" : "Буду присылать все новые");
+      me.user.min_discount = step;
+      sendSeg.querySelectorAll("button").forEach(b => b.classList.toggle("on", b === e.currentTarget));
+      sendHint.textContent = sendText(step);
+    } }, step ? "от " + step + "%" : "Все")));
+  const sendText = step => step
+    ? "В Telegram приходят только объявления, которые минимум на " + step + "% дешевле медианы по вашему поиску."
+    : "В Telegram приходит каждое новое объявление по вашим поискам.";
+  const sendHint = h("div", { class: "hint" }, sendText(me.user.min_discount));
+
+  // --- Фильтры просмотра ---
+  const search = h("input", { class: "input", placeholder: "🔍 Найти в ленте", value: F.q, autocomplete: "off" });
+  search.addEventListener("input", () => { F.q = search.value; draw(); });
+  const watchChips = h("div", { style: "display:flex;gap:6px;overflow-x:auto;padding:2px 0 8px;scrollbar-width:none" });
+  const chip = (label, value) => h("button", { class: "chip", style: "flex:none;margin:0;" + (F.watch === value ? "background:var(--accent);color:var(--accent-text)" : ""),
+    onclick: () => { tap(); F.watch = value; drawChips(); draw(); } }, label);
+  const drawChips = () => watchChips.replaceChildren(chip("Все поиски", ""),
+    ...me.watches.map(w => chip(w.title.length > 34 ? w.title.slice(0, 33) + "…" : w.title, String(w.id))));
+  const kindSeg = h("div", { class: "seg", style: "margin-bottom:8px" }, [["all", "Все"], ["deal", "🔥 Выгодные"], ["fav", "⭐ Избранное"]].map(([value, label]) =>
+    h("button", { class: F.kind === value ? "on" : "", onclick: e => {
+      tap(); F.kind = value; kindSeg.querySelectorAll("button").forEach(b => b.classList.toggle("on", b === e.currentTarget)); draw();
+    } }, label)));
+  const sort = h("select", { class: "input", style: "padding:8px 10px" },
+    [["new", "Сначала новые"], ["cheap", "Сначала дешёвые"], ["deal", "Сначала самые выгодные"]].map(([v, l]) => h("option", { value: v, selected: F.sort === v }, l)));
+  sort.addEventListener("change", () => { F.sort = sort.value; draw(); });
+
+  const dayLabel = ts => {
+    const d = new Date(ts * 1000), today = new Date(); today.setHours(0, 0, 0, 0);
+    const diff = Math.round((today - new Date(d.getFullYear(), d.getMonth(), d.getDate())) / 864e5);
+    return diff === 0 ? "Сегодня" : diff === 1 ? "Вчера" : d.toLocaleDateString("ru-RU", { day: "numeric", month: "long" });
+  };
+  const toggleStar = async (a, star) => {
+    const r = await run(api("feed/" + a.id + "/favorite", { method: "POST" }));
+    a.favorite = r.favorite; star.textContent = r.favorite ? "⭐" : "☆";
+    toast(r.favorite ? "⭐ В избранном" : "Убрано из избранного");
+    if (F.kind === "fav") draw();
+  };
+
+  function draw() {
+    const q = F.q.trim().toLowerCase();
+    let shown = items.filter(a =>
+      (!F.watch || String(a.watch_id) === F.watch) &&
+      // «Выгодные» — как 🔥 в боте: от −10% до −59%. Дешевле на 60%+ бот помечает ⚠️ —
+      // чаще всего это приманка, а не выгода.
+      (F.kind !== "deal" || (a.discount != null && a.discount >= 10 && a.discount < 60)) &&
+      (F.kind !== "fav" || a.favorite) &&
+      (!q || (a.title || "").toLowerCase().includes(q)));
+    if (F.sort === "cheap") shown = [...shown].sort((a, b) => (a.price ?? 1e15) - (b.price ?? 1e15));
+    if (F.sort === "deal") shown = [...shown].sort((a, b) => (b.discount ?? -1e9) - (a.discount ?? -1e9));
+    counter.textContent = items.length ? "Показано " + shown.length + " из " + items.length : "";
+    if (!items.length) {
+      list.replaceChildren(h("div", { class: "card empty" }, h("div", { class: "icon" }, "📭"), h("b", {}, "Пока пусто"),
+        "Здесь будут все объявления, которые я пришлю по вашим поискам."));
+      return;
+    }
+    if (!shown.length) {
+      list.replaceChildren(h("div", { class: "card empty" }, h("div", { class: "icon" }, "🔎"), h("b", {}, "Ничего не подходит"),
+        "Измените фильтры выше.", h("div", { style: "margin-top:12px" },
+          h("button", { class: "btn small secondary", onclick: () => { S.feedFilter = null; render(); } }, "Сбросить фильтры"))));
+      return;
+    }
+    if (F.sort !== "new") { list.replaceChildren(h("div", { class: "card flat" }, shown.map(a => adRow(a, toggleStar)))); return; }
+    const groups = [];
+    for (const a of shown) {
+      const label = dayLabel(a.at);
+      if (!groups.length || groups[groups.length - 1].label !== label) groups.push({ label, items: [] });
+      groups[groups.length - 1].items.push(a);
+    }
+    list.replaceChildren(...groups.map(g => h("div", {}, h("h2", { style: "margin-top:14px" }, g.label + " · " + g.items.length),
+      h("div", { class: "card flat" }, g.items.map(a => adRow(a, toggleStar))))));
+  }
+
+  drawChips();
   setView(
     h("h1", {}, "📰 Лента"),
-    h("div", { class: "card row between", onclick: () => go("profile") },
-      h("div", {}, h("div", { class: "hint" }, "Присылаю"), h("div", { class: "title" }, filter)),
-      h("span", { class: "pill accent" }, "Изменить")),
-    items.length ? h("div", { class: "card flat" }, items.map(ad => adRow(ad, async (a, star) => {
-      const r = await run(api("feed/" + a.id + "/favorite", { method: "POST" }));
-      a.favorite = r.favorite; star.textContent = r.favorite ? "⭐" : "☆";
-      toast(r.favorite ? "⭐ В избранном" : "Убрано из избранного");
-    }))) : h("div", { class: "card empty" }, h("div", { class: "icon" }, "📭"), h("b", {}, "Пока пусто"),
-      "Здесь будут все объявления, которые я пришлю по вашим поискам."));
+    h("h2", { style: "margin-top:0" }, "Что присылать в Telegram"),
+    h("div", { class: "card" }, sendSeg, sendHint),
+    h("h2", {}, "Показать в ленте"),
+    search,
+    h("div", { style: "height:8px" }),
+    me.watches.length > 1 ? watchChips : null,
+    kindSeg,
+    sort,
+    counter,
+    list);
+  draw();
 }
 async function favorites() {
   loading();
@@ -521,10 +606,6 @@ async function profile() {
   const name = [u.first_name, u.last_name].filter(Boolean).join(" ") || "Пользователь";
   const total = (a.plan === "paid" ? me.period_days : 3) * DAY;
   const pct = Math.max(0, Math.min(100, (a.until - Date.now() / 1000) / total * 100));
-  const filterSeg = h("div", { class: "seg" }, me.filter_steps.map(step =>
-    h("button", { class: u.min_discount === step ? "on" : "", onclick: async () => {
-      tap(); await run(api("settings", { method: "POST", body: { min_discount: step } }), "Сохранено"); render();
-    } }, step ? "от " + step + "%" : "Все")));
   setView(
     h("div", { class: "card row" },
       h("div", { class: "avatar" }, name[0].toUpperCase()),
@@ -570,10 +651,6 @@ async function profile() {
             try { await navigator.clipboard.writeText(me.referral.link); toast("Ссылка скопирована"); }
             catch (e) { tg && tg.showAlert ? tg.showAlert(me.referral.link) : prompt("Ссылка", me.referral.link); }
           } }, "📋 Копировать")))) : null,
-    h("h2", {}, "Фильтр выгоды"),
-    h("div", { class: "card" },
-      filterSeg,
-      h("div", { class: "hint" }, "Сравниваю цену каждого нового объявления с медианой по вашему поиску за 30 дней. «от 20%» — присылать только то, что минимум на 20% дешевле рынка.")),
     h("h2", {}, "Помощь"),
     h("div", { class: "card" }, h("details", {},
       h("summary", {}, "Как это работает"),

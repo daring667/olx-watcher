@@ -201,3 +201,12 @@ def test_edit_into_duplicate_is_refused(client):
     other = client.call("POST", "watches", json_body={"query": "xbox", "city": "list"}).get_json()["watch"]
     r = client.call("PATCH", f"watches/{other['id']}", json_body={"query": "ps5", "city": "list"})
     assert r.status_code == 400 and "уже есть" in r.get_json()["error"]
+
+
+def test_feed_items_know_their_search(client):
+    import sqlite3
+    watch = client.call("POST", "watches", json_body={"query": "ps5", "city": "list"}).get_json()["watch"]
+    db = miniapp.FeedDB(sqlite3.connect(olx_watcher.STATE_PATH))
+    db.record_delivery("777", watch["id"], olx_watcher.Listing("ID1", "u", "PS5 Slim", 250000), 20)
+    [item] = client.call("GET", "feed").get_json()["items"]
+    assert item["watch_id"] == watch["id"] and item["watch_title"] == watch["title"] and item["discount"] == 20
