@@ -790,3 +790,17 @@ def test_same_ad_from_two_searches_is_sent_once(bot, monkeypatch):
 ])
 def test_hd_image(url, expected):
     assert olx_watcher.hd_image(url) == expected
+
+
+def test_seller_repost_with_new_id_is_sent_once(bot, monkeypatch):
+    """Реальный случай: «Видеокарта б/у gtx 970 4gb» — IDrc3nv и IDrc3ph с разницей в секунду."""
+    storage, db, calls = bot
+    url, pages, cfg = poll_setup(storage, db, monkeypatch)
+    olx_feed.poll_url(db, None, "t", url, cfg, {OWNER})
+    calls.clear()
+    pages.append(pages[0] + [olx_watcher.Listing("IDrc3nv", "u1", "Видеокарта б/у gtx 970 4gb", 35000),
+                             olx_watcher.Listing("IDrc3ph", "u2", "Видеокарта  б/у GTX 970 4gb", 35000),
+                             olx_watcher.Listing("IDother", "u3", "Видеокарта б/у gtx 970 4gb", 30000)])
+    olx_feed.poll_url(db, None, "t", url, cfg, {OWNER})
+    to_777 = [kw for method, kw in calls if method == "sendMessage" and kw["chat_id"] == "777"]
+    assert len(to_777) == 2  # копия отсеяна, та же карта по другой цене — пришла

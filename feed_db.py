@@ -431,10 +431,22 @@ class FeedDB:
         self.c.commit()
         return cursor.lastrowid
 
-    def delivered(self, chat_id, ad_id: str) -> bool:
-        """Это объявление этому человеку уже присылали (по любому из его поисков)."""
-        return self._one("SELECT 1 FROM deliveries WHERE chat_id=? AND ad_id=? LIMIT 1",
-                         (str(chat_id), ad_id)) is not None
+    def delivered(self, chat_id, card, window: int = DAY) -> bool:
+        """Это объявление этому человеку уже присылали.
+
+        Тот же ad_id — по другому его поиску. Тот же заголовок и та же цена за
+        сутки — продавец выложил копию (новый ID, секундой позже), чтобы чаще
+        мелькать в выдаче. Человеку нужна одна карточка, а не две.
+        """
+        if self._one("SELECT 1 FROM deliveries WHERE chat_id=? AND ad_id=? LIMIT 1",
+                     (str(chat_id), card.ad_id)):
+            return True
+        title = " ".join((card.title or "").casefold().split())
+        if not title or card.price_kzt is None:
+            return False
+        return any(" ".join((row[0] or "").casefold().split()) == title for row in self._all(
+            "SELECT title FROM deliveries WHERE chat_id=? AND price_kzt=? AND sent_at>=?",
+            (str(chat_id), card.price_kzt, now() - window)))
 
     def delivery(self, delivery_id: int, chat_id) -> sqlite3.Row | None:
         return self._one("SELECT * FROM deliveries WHERE id=? AND chat_id=?", (delivery_id, str(chat_id)))

@@ -275,9 +275,9 @@ def poll_url(db: FeedDB, session, token: str, search_url: str, cfg: dict, owner_
                 continue
             if is_excluded(card.title, user["exclude_words"]):
                 continue
-            # Два пересекающихся поиска («gtx 970» и «видеокарты Алматы») находят
-            # одно объявление — человеку оно нужно один раз, а не по разу на поиск.
-            if db.delivered(user["chat_id"], card.ad_id):
+            # Пересекающиеся поиски находят одно объявление, а продавцы выкладывают
+            # копии с новым ID — человеку нужна одна карточка, а не несколько.
+            if db.delivered(user["chat_id"], card):
                 continue
             if send_card(db, token, user, card, line, pct):
                 sent += 1
