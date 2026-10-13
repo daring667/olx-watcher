@@ -340,11 +340,11 @@ def overview():
     events = con.execute("SELECT e.*, u.first_name, u.username FROM events e LEFT JOIN users u USING(chat_id) "
                          "ORDER BY e.id DESC LIMIT 12").fetchall()
     event_items = "".join(
-        f"<li><span>{EVENT_LABELS.get(e['kind'], escape(e['kind']))} · "
-        f"<a href='/users/{escape(e['chat_id'] or '', quote=True)}'>{escape(e['first_name'] or e['username'] or e['chat_id'] or '—')}</a></span>"
+        f"<li><span>{EVENT_LABELS.get(e['kind'], escape(e['kind']))} · {person_link(e['chat_id'], e['first_name'] or e['username'])}</span>"
         f"<span class='muted small nowrap'>{ago(e['at'])}</span></li>" for e in events) or "<li class=muted>Пока пусто</li>"
     queries = popular_queries(con, 8)
-    query_items = "".join(f"<li><span>{escape(q)}</span><b>{n}</b></li>" for q, n in queries) or "<li class=muted>Пока нет поисков</li>"
+    query_items = "".join(f"<li><a href='/searches?{urlencode({'q': q})}'>{escape(q)}</a><b>{n}</b></li>"
+                          for q, n in queries) or "<li class=muted>Пока нет поисков</li>"
     pending = s["pending"]
     body = (
         f"<div class='grid g4'>"
@@ -446,7 +446,7 @@ def user_card(chat_id: str):
                 f"<td class=num>{p['days']}</td><td class=num>{money(p['amount_kzt'])}</td></tr>" for p in payments]
     sent_rows = [f"<tr><td><a href='{escape(d['url'] or '', quote=True)}' target=_blank rel=noopener>{escape(d['title'] or '—')}</a></td>"
                  f"<td class=num>{money(d['price_kzt'])}</td><td>{discount_pill(d['discount_pct'])}</td><td class=nowrap>{ago(d['sent_at'])}</td></tr>" for d in sent]
-    event_rows = [f"<li><span>{EVENT_LABELS.get(e['kind'], escape(e['kind']))} <span class=muted>· {event_detail(db, e)}</span></span>"
+    event_rows = [f"<li><span>{EVENT_LABELS.get(e['kind'], escape(e['kind']))}{with_detail(db, e)}</span>"
                   f"<span class='muted small nowrap'>{dt(e['at'])}</span></li>" for e in events]
     name = " ".join(filter(None, [user["first_name"], user["last_name"]])) or chat_id
     body = (f"<div class='grid g2'><div class=card>{info}</div>"
@@ -489,13 +489,43 @@ def user_grant(chat_id: str):
     return back(f"/users/{quote(chat_id)}", f"Доступ до {dt(user['paid_until'], '%d.%m.%Y %H:%M')}")
 
 
+def external(url: str, label: str) -> str:
+    return f"<a href='{escape(url, quote=True)}' target=_blank rel=noopener>{escape(label)}</a>"
+
+
 def event_detail(db, event) -> str:
-    """Подробность события: у реферальных там ID друга — показываем имя со ссылкой."""
-    detail = event["detail"] or ""
-    if event["kind"] in {"referral_join", "referral_reward"} and detail:
+    """Подробность события ссылкой, а не сырым ID или адресом.
+
+    В журнал пишется то, что было под рукой: ссылка поиска, ID поиска, ID
+    объявления, ID друга. Здесь это превращается в название, по которому
+    можно кликнуть.
+    """
+    from olx_feed import watch_title
+    detail = (event["detail"] or "").strip()
+    kind, chat_id = event["kind"], event["chat_id"]
+    if not detail:
+        return ""
+    if kind in {"referral_join", "referral_reward"}:
         friend = db.user(detail)
         return person_link(detail, (friend["first_name"] or friend["username"]) if friend else None)
-    return escape(detail[:60])
+    if kind in {"watch_add", "watch_edit"} and detail.startswith("http"):
+        watch = db.c.execute("SELECT title FROM watches WHERE search_url=? AND chat_id=?", (detail, chat_id)).fetchone()
+        return external(detail, watch["title"] if watch else watch_title(detail))
+    if kind in {"watch_delete", "watch_pause", "watch_resume"} and detail.isdigit():
+        watch = db.watch(int(detail))
+        return external(watch["search_url"], watch["title"]) if watch else f"поиск #{escape(detail)} (удалён)"
+    if kind == "favorite_add":
+        ad = db.c.execute("SELECT title, url FROM deliveries WHERE ad_id=? AND url IS NOT NULL ORDER BY id DESC LIMIT 1",
+                          (detail,)).fetchone()
+        return external(ad["url"], ad["title"] or detail) if ad else escape(detail)
+    if detail.startswith("http"):
+        return external(detail, watch_title(detail) if "olx.kz" in detail else detail[:60])
+    return escape(detail[:80])
+
+
+def with_detail(db, event) -> str:
+    detail = event_detail(db, event)
+    return f" <span class=muted>· {detail}</span>" if detail else ""
 
 
 def status_pill(status: str) -> str:
@@ -606,7 +636,7 @@ def searches():
     queries = popular_queries(con, 20)
     top = max((n for _, n in queries), default=1)
     query_bars = "".join(
-        f"<div class=row><span title='{escape(q, quote=True)}' style='overflow:hidden;text-overflow:ellipsis;white-space:nowrap'>{escape(q)}</span>"
+        f"<div class=row><a href='/searches?{urlencode({'q': q})}' title='{escape(q, quote=True)}' style='overflow:hidden;text-overflow:ellipsis;white-space:nowrap'>{escape(q)}</a>"
         f"<div><div class=bar style='width:{n / top * 100:.1f}%'></div></div><b class=num>{n}</b></div>" for q, n in queries)
     body = (f"<div class='grid g2'><div class='card funnel'><div class=chart-title><b>Популярные запросы</b><span>сколько поисков</span></div>"
             f"{query_bars or '<div class=muted>Пока нет</div>'}</div>"
@@ -642,7 +672,8 @@ def deliveries():
 # --- 🧾 Журнал ------------------------------------------------------------------
 @app.get("/events")
 def events():
-    con = feed_db().c
+    db = feed_db()
+    con = db.c
     kind = request.args.get("k", "")
     where, params = ("WHERE e.kind=?", [kind]) if kind else ("", [])
     rows = con.execute(f"SELECT e.*, u.first_name, u.username FROM events e LEFT JOIN users u USING(chat_id) "
@@ -653,7 +684,7 @@ def events():
                      f"{EVENT_LABELS.get(k['kind'], escape(k['kind']))} · {k['n']}</a>" for k in kinds))
     lines = [f"<tr><td class=nowrap>{dt(e['at'], '%d.%m %H:%M:%S')}</td><td>{EVENT_LABELS.get(e['kind'], escape(e['kind']))}</td>"
              f"<td>{person_link(e['chat_id'], e['first_name'] or e['username'])}</td>"
-             f"<td class='muted small' style='max-width:420px;overflow:hidden;text-overflow:ellipsis'>{escape(e['detail'] or '')}</td></tr>"
+             f"<td class=small style='max-width:420px'>{event_detail(db, e)}</td></tr>"
              for e in rows]
     con.close()
     return layout("Журнал", "/events", f"<div class=toolbar><div class=chips>{chips}</div></div>" +

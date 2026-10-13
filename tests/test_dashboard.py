@@ -76,3 +76,20 @@ def test_cross_site_post_is_refused(panel):
 def test_old_gpu_addresses_redirect(panel):
     assert panel.get("/passed").location.endswith("/gpu/passed")
     assert panel.get("/price/ID1").location.endswith("/gpu/price/ID1")
+
+
+def test_journal_details_are_links(panel):
+    import sqlite3
+    db = FeedDB(sqlite3.connect(panel.path))
+    watch = db.watches("777")[0]
+    db.log("777", "watch_pause", str(watch["id"]))
+    db.add_favorite(db.recent_deliveries("777")[0])
+    db.log("777", "watch_delete", "999")
+    html = panel.get("/users/777").get_data(as_text=True)
+    assert f"href='{watch['search_url']}'" in html and "«1070 ti» · Алматы</a>" in html   # поиск ссылкой с названием
+    assert "href='https://olx.kz/1'" in html and "GTX 1070 Ti</a>" in html                 # избранное — объявление
+    assert "поиск #999 (удалён)" in html
+    assert "пришёл в бота</span>" not in html or "пришёл в бота ·" not in html            # без висящей точки
+    events_page = panel.get("/events").get_data(as_text=True)
+    assert f"href='{watch['search_url']}'" in events_page
+    assert "href='/users/888'" in panel.get("/users/777").get_data(as_text=True)          # друг — карточкой
