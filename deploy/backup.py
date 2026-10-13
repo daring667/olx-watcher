@@ -109,23 +109,36 @@ def rclone(*args: str) -> bool:
     return result.returncode == 0
 
 
-def upload_to_drive(target: Path, daily: bool) -> bool:
-    """Копия на Google Диск и чистка старых. Сбой не роняет бэкап — локальная копия уже есть."""
+def upload_to_drive(target: Path) -> str:
+    """Копия на Google Диск и чистка старых. Возвращает, куда легло: '', 'hourly', 'hourly+daily'.
+
+    Есть ли уже копия за сегодня в daily/, смотрим на самом Диске: счёт
+    локальных файлов врал, когда таймер срабатывал сам при перезапуске.
+    """
     remote = os.environ.get("BACKUP_RCLONE_REMOTE", "").rstrip("/")
-    if not remote:
-        return False
-    ok = rclone("copyto", str(target), f"{remote}/hourly/{target.name}")
+    if not remote or not rclone("copyto", str(target), f"{remote}/hourly/{target.name}"):
+        return ""
     rclone("delete", f"{remote}/hourly", "--min-age", DRIVE_HOURLY_AGE)
-    if ok and daily:
-        ok = rclone("copyto", str(target), f"{remote}/daily/{target.name}")
-        rclone("delete", f"{remote}/daily", "--min-age", DRIVE_DAILY_AGE)
-    return ok
-
-
-def first_today() -> bool:
-    """Первая копия за сутки — её же шлём в Telegram и кладём в daily/."""
     today = datetime.now().strftime("%Y%m%d")
-    return len(list(DESTINATION.glob(f"watcher-{today}-*.sqlite3.gz"))) == 1
+    listing = subprocess.run(["rclone", "lsf", f"{remote}/daily", "--include", f"watcher-{today}-*"],
+                             capture_output=True, text=True, timeout=120)
+    if listing.returncode == 0 and listing.stdout.strip():
+        return "hourly"
+    if rclone("copyto", str(target), f"{remote}/daily/{target.name}"):
+        rclone("delete", f"{remote}/daily", "--min-age", DRIVE_DAILY_AGE)
+        return "hourly+daily"
+    return "hourly"
+
+
+def telegram_due() -> bool:
+    """Архив в Telegram — раз в сутки; отметка — пустой файл в папке бэкапов."""
+    marker = DESTINATION / f".telegram-{datetime.now():%Y%m%d}"
+    if marker.exists():
+        return False
+    for old in DESTINATION.glob(".telegram-*"):
+        old.unlink()
+    marker.touch()
+    return True
 
 
 def main() -> None:
@@ -146,10 +159,10 @@ def main() -> None:
     print(f"Копия: {target} ({size:.0f} КБ, объявлений {ads}); удалено старых: {removed}")
     caption = (f"🗄 Бэкап базы {datetime.now():%d.%m.%Y}: пользователей {users}, оплат {paid}, "
                f"{size:.0f} КБ. Храните этот файл — из него восстанавливается всё.")
-    daily = first_today()
-    if upload_to_drive(target, daily):
-        print("Копия на Google Диске" + (" (и в daily/)" if daily else ""))
-    if daily and send_to_owner(target, caption):
+    where = upload_to_drive(target)
+    if where:
+        print(f"Копия на Google Диске: {where}")
+    if telegram_due() and send_to_owner(target, caption):
         print("Архив отправлен владельцу в Telegram")
 
 
