@@ -147,7 +147,8 @@ def extract_listings(search_url: str, page: str, limit: int) -> list[Listing]:
         limit = min(limit, total)
     scope = grids[0] if grids else soup
     for card in scope.select('[data-cy="l-card"], [data-testid="l-card"], article, li'):
-        link = next((a for a in card.select("a[href]") if "/d/obyavlenie/" in a.get("href", "")), None)
+        # Обычные объявления — /d/obyavlenie/…, вакансии — /obyavlenie/rabota/… без /d/.
+        link = next((a for a in card.select("a[href]") if "/obyavlenie/" in a.get("href", "")), None)
         if not link:
             continue
         url = urljoin(search_url, link["href"]).split("?")[0]
@@ -167,7 +168,7 @@ def extract_listings(search_url: str, page: str, limit: int) -> list[Listing]:
         if len(found) >= limit:
             break
     if not found and not grids:  # запасной вариант для изменившейся вёрстки OLX
-        for link in soup.select('a[href*="/d/obyavlenie/"]'):
+        for link in soup.select('a[href*="/obyavlenie/"]'):
             url = urljoin(search_url, link["href"]).split("?")[0]
             ad_id = ad_id_from_url(url)
             if ad_id:

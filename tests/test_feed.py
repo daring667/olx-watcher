@@ -837,3 +837,59 @@ def test_empty_search_warns_user_once(bot, monkeypatch):
     olx_feed.poll_url(db, None, "t", url, cfg, {OWNER})
     olx_feed.poll_url(db, None, "t", url, cfg, {OWNER})
     assert sum("нет ни одного объявления" in t for t in texts(calls)) == 1
+
+
+# --- Тонкая настройка поиска ----------------------------------------------------
+def test_apply_filters_keeps_category_and_replaces_filters():
+    url = olx_feed.apply_filters("https://www.olx.kz/elektronika/alma-ata/q-1070-ti/?search%5Bfilter_float_price%3Ato%5D=50000",
+                                 10000, 200000, "used")
+    assert url.startswith("https://www.olx.kz/elektronika/alma-ata/q-1070-ti/?")
+    assert "filter_float_price%3Afrom%5D=10000" in url and "filter_float_price%3Ato%5D=200000" in url
+    assert "filter_enum_state%5D%5B0%5D=used" in url and "50000" not in url
+    assert "filter_enum_state" not in olx_feed.apply_filters(url, None, None, "")
+
+
+def test_title_shows_condition():
+    url = olx_feed.build_search_url("iphone 13", "alma-ata", None, 200000, "new")
+    assert olx_feed.watch_title(url) == "«iphone 13» · Алматы · новое · до 200 000 ₸"
+
+
+def test_job_cards_without_d_prefix_are_parsed():
+    """У вакансий ссылки /obyavlenie/rabota/… — без /d/, и раньше их не видно было вовсе."""
+    html_page = ('<span data-testid="total-count">Мы нашли 1 объявление</span><div data-testid="listing-grid">'
+                 '<div data-cy="l-card"><a href="/obyavlenie/rabota/elektronschik-IDraBal.html"><h4>Электронщик</h4></a></div></div>')
+    [card] = olx_watcher.extract_listings("https://www.olx.kz/rabota/", html_page, 60)
+    assert card.ad_id == "IDraBal"
+
+
+def test_preview_parses_total_categories_and_exclusions(monkeypatch):
+    html_page = ('<span data-testid="total-count">Мы нашли 2 объявления</span>'
+                 '<div data-testid="category-count-links"><a href="/elektronika/alma-ata/q-1070-ti/">Электроника 2</a></div>'
+                 '<div data-testid="listing-grid">'
+                 '<div data-cy="l-card"><a href="/d/obyavlenie/a-IDa.html"><h4>GTX 1070 Ti</h4><p data-testid="ad-price">60 000 тг.</p></a></div>'
+                 '<div data-cy="l-card"><a href="/d/obyavlenie/b-IDb.html"><h4>Компьютер с 1070 Ti</h4><p data-testid="ad-price">180 000 тг.</p></a></div>'
+                 '</div>')
+
+    class Session:
+        def get(self, url, timeout):
+            return type("R", (), {"text": html_page, "raise_for_status": lambda self: None})()
+
+    url = olx_feed.build_search_url("1070 ti", "alma-ata", None, 200000)
+    p = olx_feed.preview(Session(), url, "компьютер")
+    assert p["total"] == 2 and p["median"] == 180000
+    assert p["categories"][0]["name"] == "Электроника" and p["categories"][0]["count"] == 2
+    assert "/elektronika/alma-ata/q-1070-ti/" in p["categories"][0]["url"]
+    assert "filter_float_price%3Ato%5D=200000" in p["categories"][0]["url"]  # фильтры сохранились
+    assert [i["excluded"] for i in p["items"]] == [False, True]
+
+
+def test_parse_search_roundtrip():
+    url = olx_feed.apply_filters("https://www.olx.kz/elektronika/alma-ata/q-1070-ti/", 10000, 200000, "used")
+    form = olx_feed.parse_search(url, "«1070 ti» · Электроника · Алматы · б/у · 10 000 ₸–200 000 ₸")
+    assert form["mode"] == "builder" and form["query"] == "1070 ti" and form["city"] == "alma-ata"
+    assert (form["low"], form["high"], form["state"]) == ("10000", "200000", "used")
+    assert form["crumbs"] == [{"name": "Электроника"}] and form["base"].endswith("/elektronika/alma-ata/q-1070-ti/")
+    # Пересборка из формы даёт тот же поиск.
+    assert olx_feed.apply_filters(form["base"], 10000, 200000, "used") == url
+    link = olx_feed.parse_search("https://www.olx.kz/transport/legkovye-avtomobili/bmw/?search%5Border%5D=created_at%3Adesc")
+    assert link["mode"] == "link" and link["link"] == "https://www.olx.kz/transport/legkovye-avtomobili/bmw/"

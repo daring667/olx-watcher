@@ -35,7 +35,7 @@ from curl_cffi import requests as impersonated
 # Через модуль, а не `from … import`: тесты подменяют olx_watcher.telegram_request,
 # и подмена должна действовать и здесь.
 import olx_watcher as w
-from feed_db import DAY, REFERRAL_DAYS, FeedDB, is_excluded
+from feed_db import DAY, REFERRAL_DAYS, FeedDB, is_excluded, normalize_words
 
 DEFAULTS = {
     "enabled": False,
@@ -143,19 +143,111 @@ def normalize_search_url(raw: str) -> str | None:
     return urlunsplit(("https", "www.olx.kz", path, urlencode(sorted(query.items())), ""))
 
 
-def build_search_url(query: str, city: str = "list", price_from: int | None = None,
-                     price_to: int | None = None) -> str | None:
-    """Ссылка выдачи из конструктора: запрос, город и цена — без копирования с OLX."""
+PRICE_FROM, PRICE_TO = "search[filter_float_price:from]", "search[filter_float_price:to]"
+STATE_KEY = "search[filter_enum_state][0]"
+STATES = {"used": "б/у", "new": "новое"}  # порядок важен: так кнопки идут в приложении
+
+
+def search_path(query: str, city: str = "list") -> str | None:
     words = re.sub(r"[^\w]+", "-", (query or "").strip().casefold()).strip("-")
     if not words or city not in CITIES:
         return None
-    url = f"https://www.olx.kz/{city}/q-{words}/"
-    query_params = []
+    return f"https://www.olx.kz/{city}/q-{words}/"
+
+
+def apply_filters(url: str, price_from=None, price_to=None, state: str = "") -> str | None:
+    """Ставит на ссылку выдачи цену и состояние (б/у / новое), остальное сохраняет."""
+    url = normalize_search_url(url or "")
+    if not url:
+        return None
+    parts = urlsplit(url)
+    query = {k: v for k, v in parse_qsl(parts.query, keep_blank_values=True)
+             if k not in {PRICE_FROM, PRICE_TO, STATE_KEY}}
     if price_from:
-        query_params.append(f"search%5Bfilter_float_price%3Afrom%5D={int(price_from)}")
+        query[PRICE_FROM] = str(int(price_from))
     if price_to:
-        query_params.append(f"search%5Bfilter_float_price%3Ato%5D={int(price_to)}")
-    return normalize_search_url(url + ("?" + "&".join(query_params) if query_params else ""))
+        query[PRICE_TO] = str(int(price_to))
+    if state in STATES:
+        query[STATE_KEY] = state
+    return normalize_search_url(urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), "")))
+
+
+def build_search_url(query: str, city: str = "list", price_from: int | None = None,
+                     price_to: int | None = None, state: str = "") -> str | None:
+    """Ссылка выдачи из конструктора: запрос, город, цена, состояние — без копирования с OLX."""
+    path = search_path(query, city)
+    return apply_filters(path, price_from, price_to, state) if path else None
+
+
+def preview(session, url: str, exclude: str = "") -> dict:
+    """Что найдётся по поиску — до того, как человек его сохранит.
+
+    Опечатка («1070 it») видна сразу: «ничего не найдено», а не поток чужих
+    объявлений потом. Категории OLX отдаёт сам («Электроника 31, Услуги 2») —
+    по ним поиск сужается в одно нажатие, текущие фильтры при этом сохраняются.
+    """
+    from bs4 import BeautifulSoup
+
+    response = session.get(url, timeout=25)
+    response.raise_for_status()
+    soup = BeautifulSoup(response.text, "html.parser")
+    cards = w.extract_listings(url, response.text, 60)
+    total = w.found_total(soup)
+    filters = [(k, v) for k, v in parse_qsl(urlsplit(url).query) if k != ORDER_KEY]
+    categories = []
+    for a in soup.select('[data-testid="category-count-links"] a[href]'):
+        label = w.text(a)
+        match = re.match(r"(.+?)\s+([\d\s\u00a0]+)$", label)
+        target = normalize_search_url(urljoin_olx(a["href"]))
+        if not match or not target:
+            continue
+        parts = urlsplit(target)
+        merged = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(filters), ""))
+        categories.append({"name": match.group(1).strip(), "count": int(re.sub(r"\D", "", match.group(2))),
+                           "url": normalize_search_url(merged)})
+    prices = sorted(c.price_kzt for c in cards if c.price_kzt)
+    return {
+        "url": url, "title": watch_title(url),
+        "total": total if total is not None else len(cards),
+        "median": prices[len(prices) // 2] if prices else None,
+        "categories": categories[:12],
+        "items": [{"title": c.title, "price": c.price_kzt, "image": c.image_url, "url": c.url,
+                   "excluded": is_excluded(c.title, normalize_words(exclude))} for c in cards[:8]],
+    }
+
+
+def parse_search(url: str, title: str = "") -> dict:
+    """Обратно из ссылки в поля конструктора — для «✏️ Настроить» у готового поиска.
+
+    Если в ссылке нет «q-…» (поиск по ссылке с OLX без запроса), форма
+    открывается в режиме «Ссылка». Категория — всё, что в пути стоит перед
+    городом. Её человеческое имя берём из названия поиска, а не из адреса.
+    """
+    parts = urlsplit(url)
+    query = dict(parse_qsl(parts.query))
+    segments = [unquote(s) for s in parts.path.split("/") if s and s != "d"]
+    words = next((s[2:].replace("-", " ") for s in segments if s.startswith("q-")), "")
+    city = next((s for s in segments if s in CITIES), "list")
+    category = [s for s in segments if not s.startswith("q-") and s not in CITIES]
+    form = {"mode": "builder" if words and (city != "list" or "list" in segments) else "link",
+            "query": words, "city": city,
+            "low": str(int(float(query[PRICE_FROM]))) if query.get(PRICE_FROM) else "",
+            "high": str(int(float(query[PRICE_TO]))) if query.get(PRICE_TO) else "",
+            "state": query.get(STATE_KEY, "") if query.get(STATE_KEY) in STATES else "",
+            "base": "", "crumbs": [], "link": ""}
+    if form["mode"] == "link":
+        clean = {k: v for k, v in query.items() if k not in {PRICE_FROM, PRICE_TO, STATE_KEY, ORDER_KEY}}
+        form["link"] = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(clean), ""))
+    elif category:
+        form["base"] = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+        known = {CITIES.get(city, ""), "«" + words + "»"} | set(STATES.values())
+        label = next((t for t in title.split(" · ") if t and t not in known and "₸" not in t), category[-1])
+        form["crumbs"] = [{"name": label}]
+    return form
+
+
+def urljoin_olx(href: str) -> str:
+    return href if href.startswith("http") else "https://www.olx.kz" + href
 
 
 def watch_title(search_url: str) -> str:
@@ -167,6 +259,8 @@ def watch_title(search_url: str) -> str:
     label = " · ".join((["«" + words[0] + "»"] if words else []) + rest[-2:])
     query = dict(parse_qsl(parts.query))
     low, high = query.get("search[filter_float_price:from]"), query.get("search[filter_float_price:to]")
+    if query.get(STATE_KEY) in STATES:
+        label += f" · {STATES[query[STATE_KEY]]}"
     if low and high:
         label += f" · {money(int(float(low)))}–{money(int(float(high)))}"
     elif low or high:
@@ -605,6 +699,7 @@ def watch_screen(db: FeedDB, watch, cfg: dict) -> tuple[str, str]:
             markup([link("🌐 Открыть выдачу на OLX", watch["search_url"])],
                    [toggle, button("🗑 Удалить", f"u:wd:{watch['id']}")],
                    [button("🚫 Слова-исключения", f"u:wx:{watch['id']}")],
+                   [{"text": "✏️ Настроить в приложении", "web_app": {"url": cfg["miniapp_url"]}}] if cfg["miniapp_url"] else [],
                    [button("⬅️ Мои поиски", "u:list"), HOME]))
 
 

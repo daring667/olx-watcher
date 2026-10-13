@@ -371,6 +371,18 @@ class FeedDB:
         return bool(self._write("UPDATE watches SET paused=? WHERE id=? AND chat_id=?",
                                 (int(paused), watch_id, str(chat_id))).rowcount)
 
+    def update_watch_search(self, watch_id: int, chat_id, search_url: str, title: str) -> bool:
+        """Новая ссылка и название у готового поиска. False — такой поиск у человека уже есть."""
+        try:
+            changed = self._write("UPDATE watches SET search_url=?, title=? WHERE id=? AND chat_id=?",
+                                  (search_url, title, watch_id, str(chat_id))).rowcount
+        except sqlite3.IntegrityError:
+            self.c.rollback()
+            return False
+        if changed:
+            self.log(chat_id, "watch_edit", search_url)
+        return bool(changed)
+
     def set_watch_exclude(self, watch_id: int, chat_id, words: str) -> bool:
         return bool(self._write("UPDATE watches SET exclude_words=? WHERE id=? AND chat_id=?",
                                 (normalize_words(words), watch_id, str(chat_id))).rowcount)

@@ -186,11 +186,12 @@ def me():
     return jsonify(
         brand=g.cfg["brand"], user=user_json(user), access=access(user),
         max_watches=None if g.owner else int(g.cfg["max_watches"]),
-        accessory_words=feed.ACCESSORY_WORDS,
+        accessory_words=feed.ACCESSORY_WORDS, states=list(feed.STATES.items()),
         filter_steps=list(feed.FILTER_STEPS), price=int(g.cfg["price_kzt"]),
         period_days=int(g.cfg["period_days"]), payment_text=g.cfg["payment_text"],
         price_stars=int(g.cfg["price_stars"]),
-        pending_payment=pending, cities=feed.CITIES,
+        # Списками пар, а не словарями: jsonify сортирует ключи, и «Алматы» уезжал в середину.
+        pending_payment=pending, cities=list(feed.CITIES.items()),
         watches=[watch_json(row) for row in db.watches(user["chat_id"])],
         favorites_count=db.count("favorites", user["chat_id"]),
         referral=dict(zip(("invited", "paid"), db.referral_stats(user["chat_id"])),
@@ -198,28 +199,52 @@ def me():
     )
 
 
+def search_from_body(data: dict) -> tuple[str | None, str]:
+    """Ссылка поиска из запроса приложения: готовая ссылка или конструктор + фильтры."""
+    if data.get("url") and "/obyavlenie/" in data["url"]:
+        return None, "Это ссылка на одно объявление. Нужна ссылка на список с фильтрами."
+    try:
+        low = int(data["price_from"]) if data.get("price_from") else None
+        high = int(data["price_to"]) if data.get("price_to") else None
+    except (TypeError, ValueError):
+        return None, "Цена — только цифры"
+    if low and high and low > high:
+        return None, "Цена «от» больше, чем «до»"
+    base = data.get("url") or feed.search_path(data.get("query", ""), data.get("city", "list"))
+    url = feed.apply_filters(base, low, high, data.get("state", "")) if base else None
+    return url, "" if url else "Не получилось составить поиск — проверьте ссылку или запрос"
+
+
+@app.post("/api/preview")
+def preview_search():
+    """Что найдётся по поиску — до сохранения. Ходит в OLX, поэтому свой лимит."""
+    url, problem = search_from_body(body())
+    if not url:
+        return error(problem)
+    if not g.owner and feed.flooding("preview:" + g.user["chat_id"], limit=20, window=60):
+        return error("Слишком часто — подождите минуту", 429)
+    try:
+        return jsonify(feed.preview(feed.make_session(g.cfg["proxy"]), url, body().get("exclude", "")))
+    except Exception:
+        logging.exception("preview %s", url)
+        return error("OLX сейчас не ответил — попробуйте ещё раз", 502)
+
+
 @app.post("/api/watches")
 def add_watch():
     data, user = body(), g.user
     if not feed.is_active(user, g.owner_ids):
         return error("Доступ закончился — продлите подписку во вкладке «Профиль»", 402)
-    if data.get("url"):
-        if "/obyavlenie/" in data["url"]:
-            return error("Это ссылка на одно объявление. Нужна ссылка на список с фильтрами.")
-        url = feed.normalize_search_url(data["url"])
-    else:
-        try:
-            low = int(data["price_from"]) if data.get("price_from") else None
-            high = int(data["price_to"]) if data.get("price_to") else None
-        except (TypeError, ValueError):
-            return error("Цена — только цифры")
-        url = feed.build_search_url(data.get("query", ""), data.get("city", "list"), low, high)
+    url, problem = search_from_body(data)
     if not url:
-        return error("Не получилось составить поиск — проверьте ссылку или запрос")
+        return error(problem)
     limit = int(g.cfg["max_watches"])
     if not g.owner and g.db.count("watches", user["chat_id"]) >= limit:
         return error(f"Можно следить максимум за {limit} поисками — удалите ненужный")
-    watch_id = g.db.add_watch(user["chat_id"], url, feed.watch_title(url))
+    # Название из приложения человекочитаемое («Компьютеры и комплектующие»),
+    # а не из адреса («kompyutery-i-komplektuyuschie»).
+    title = " ".join(str(data.get("title") or "").split())[:90] or feed.watch_title(url)
+    watch_id = g.db.add_watch(user["chat_id"], url, title)
     if watch_id is None:
         return error("За этим поиском вы уже следите")
     if data.get("exclude"):
@@ -237,7 +262,26 @@ def update_watch(watch_id: int):
         g.db.log(chat_id, "watch_pause" if data["paused"] else "watch_resume", str(watch_id))
     if "exclude" in data:
         g.db.set_watch_exclude(watch_id, chat_id, str(data["exclude"] or ""))
+    if data.get("query") or data.get("url"):
+        # Изменили сам поиск: новая ссылка, название. Новую выдачу опрос сам
+        # «запомнит» без рассылки, а уже присланное повторно не придёт.
+        url, problem = search_from_body(data)
+        if not url:
+            return error(problem)
+        title = " ".join(str(data.get("title") or "").split())[:90] or feed.watch_title(url)
+        if not g.db.update_watch_search(watch_id, chat_id, url, title):
+            return error("Такой поиск у вас уже есть")
     return jsonify(watch=watch_json(g.db.watch(watch_id)))
+
+
+@app.get("/api/watches/<int:watch_id>/form")
+def watch_form(watch_id: int):
+    """Поля конструктора для «✏️ Настроить»."""
+    watch = g.db.watch(watch_id, g.user["chat_id"])
+    if not watch:
+        return error("Поиск не найден", 404)
+    return jsonify(form={**feed.parse_search(watch["search_url"], watch["title"]),
+                         "exclude": watch["exclude_words"]})
 
 
 @app.delete("/api/watches/<int:watch_id>")

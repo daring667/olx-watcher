@@ -67,7 +67,7 @@ def test_me_registers_user_with_trial(client):
     data = client.call("GET", "me", username="vasya").get_json()
     assert data["access"]["active"] and data["user"]["plan"] == "trial"
     assert data["user"]["username"] == "vasya" and data["max_watches"] == 2
-    assert "alma-ata" in data["cities"]
+    assert ["alma-ata", "Алматы"] in data["cities"] and data["cities"][0][0] == "list"
 
 
 def test_add_search_from_builder_and_link(client):
@@ -157,3 +157,47 @@ def test_invoice_link(client, monkeypatch):
                         lambda token, method, **kw: {"result": "https://t.me/$invoice"} if method == "createInvoiceLink" else {"result": {}})
     r = client.call("POST", "invoice")
     assert r.get_json()["link"] == "https://t.me/$invoice"
+
+
+def test_preview_endpoint(client, monkeypatch):
+    seen = {}
+
+    def fake_preview(session, url, exclude=""):
+        seen["url"], seen["exclude"] = url, exclude
+        return {"url": url, "title": "t", "total": 0, "median": None, "categories": [], "items": []}
+
+    monkeypatch.setattr(miniapp.feed, "preview", fake_preview)
+    r = client.call("POST", "preview", json_body={"query": "1070 it", "city": "alma-ata", "state": "used", "exclude": "чехол"})
+    assert r.status_code == 200 and r.get_json()["total"] == 0
+    assert "q-1070-it" in seen["url"] and "used" in seen["url"] and seen["exclude"] == "чехол"
+    r = client.call("POST", "preview", json_body={"query": "x", "city": "list", "price_from": "500", "price_to": "100"})
+    assert r.status_code == 400
+
+
+def test_add_watch_with_category_url_and_title(client):
+    r = client.call("POST", "watches", json_body={
+        "url": "https://www.olx.kz/elektronika/alma-ata/q-1070-ti/", "price_to": "200000", "state": "used",
+        "title": "«1070 ti» · Электроника · Алматы · б/у"})
+    watch = r.get_json()["watch"]
+    assert watch["title"] == "«1070 ti» · Электроника · Алматы · б/у"
+    assert "elektronika" in watch["url"] and "used" in watch["url"] and "200000" in watch["url"]
+
+
+def test_edit_existing_search(client):
+    watch = client.call("POST", "watches", json_body={"query": "1070 it", "city": "alma-ata", "price_to": "200000"}).get_json()["watch"]
+    form = client.call("GET", f"watches/{watch['id']}/form").get_json()["form"]
+    assert form["query"] == "1070 it" and form["city"] == "alma-ata" and form["high"] == "200000"
+    r = client.call("PATCH", f"watches/{watch['id']}", json_body={
+        "query": "1070 ti", "city": "alma-ata", "price_to": "150000", "state": "used", "exclude": "компьютер",
+        "title": "«1070 ti» · Алматы · б/у · до 150 000 ₸"})
+    updated = r.get_json()["watch"]
+    assert "q-1070-ti" in updated["url"] and "150000" in updated["url"] and "used" in updated["url"]
+    assert updated["title"] == "«1070 ti» · Алматы · б/у · до 150 000 ₸" and updated["exclude"] == "компьютер"
+    assert client.call("GET", f"watches/{watch['id']}/form", user_id=888).status_code == 404  # чужой
+
+
+def test_edit_into_duplicate_is_refused(client):
+    client.call("POST", "watches", json_body={"query": "ps5", "city": "list"})
+    other = client.call("POST", "watches", json_body={"query": "xbox", "city": "list"}).get_json()["watch"]
+    r = client.call("PATCH", f"watches/{other['id']}", json_body={"query": "ps5", "city": "list"})
+    assert r.status_code == 400 and "уже есть" in r.get_json()["error"]
