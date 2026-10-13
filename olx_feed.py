@@ -253,7 +253,17 @@ def poll_url(db: FeedDB, session, token: str, search_url: str, cfg: dict, owner_
             db.store_cards(search_url, more)
             time.sleep(float(cfg["url_delay_seconds"]))
         db.mark_polled(search_url, baseline_done=True)
-        logging.info("Публичный поиск: базовый снимок %s", search_url)
+        logging.info("Публичный поиск: базовый снимок %s (%d объявл.)", search_url, len(cards))
+        if not cards:
+            # Пустой поиск почти всегда — опечатка («1070 it» вместо «1070 ti»).
+            # Говорим сразу, а не оставляем человека ждать уведомлений, которых не будет.
+            for user in db.subscribers(search_url):
+                watch = db.watch(user["watch_id"])
+                safe_send(db, token, user["chat_id"],
+                          f"🤔 <b>По поиску «{html.escape(watch['title'])}» сейчас нет ни одного объявления.</b>\n"
+                          "Проверьте, нет ли опечатки в запросе, или расширьте фильтры (город, цену). "
+                          "Поиск продолжит работать — если что-то появится, пришлю.",
+                          reply_markup=markup([button("🔍 Открыть поиск", f"u:w:{watch['id']}")], [HOME]))
         return 0
     db.mark_polled(search_url)
     known = db.known_ads(search_url, [c.ad_id for c in cards])

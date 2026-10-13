@@ -804,3 +804,36 @@ def test_seller_repost_with_new_id_is_sent_once(bot, monkeypatch):
     olx_feed.poll_url(db, None, "t", url, cfg, {OWNER})
     to_777 = [kw for method, kw in calls if method == "sendMessage" and kw["chat_id"] == "777"]
     assert len(to_777) == 2  # копия отсеяна, та же карта по другой цене — пришла
+
+
+# --- Рекомендации OLX вместо результатов ----------------------------------------
+def page(total, results, recommended):
+    card = lambda i, title, price: (f'<div data-cy="l-card"><a href="/d/obyavlenie/x-ID{i}.html"><h4>{title}</h4>'
+                                    f'<p data-testid="ad-price">{price} тг.</p></a></div>')
+    grid = lambda cards: '<div data-testid="listing-grid">' + "".join(cards) + "</div>"
+    return (f'<span data-testid="total-count">Мы нашли {total} объявлений</span>'
+            + grid(card(f"r{i}", t, p) for i, (t, p) in enumerate(results))
+            + grid(card(f"x{i}", t, p) for i, (t, p) in enumerate(recommended)))
+
+
+def test_zero_results_page_gives_no_cards():
+    """Опечатка «1070 it»: OLX нашёл 0 и показал рекомендации — котят и шины."""
+    html_page = page(0, [], [("Котёнок в хорошие руки", "500"), ("Шины 195/65/15", "20 000")])
+    assert olx_watcher.extract_listings("https://www.olx.kz/x/", html_page, 60) == []
+
+
+def test_recommendations_after_results_are_ignored():
+    html_page = page(2, [("GTX 1070 Ti", "60 000"), ("Palit 1070 Ti", "55 000")], [("Квадроцикл", "450 000")])
+    titles = [c.title for c in olx_watcher.extract_listings("https://www.olx.kz/x/", html_page, 60)]
+    assert titles == ["GTX 1070 Ti", "Palit 1070 Ti"]
+
+
+def test_empty_search_warns_user_once(bot, monkeypatch):
+    storage, db, calls = bot
+    say(storage, 777, "https://www.olx.kz/alma-ata/q-1070-it/")
+    url = db.watches("777")[0]["search_url"]
+    monkeypatch.setattr(olx_feed, "fetch_cards", lambda session, search_url, page=1: [])
+    cfg = olx_feed.settings(CONFIG)
+    olx_feed.poll_url(db, None, "t", url, cfg, {OWNER})
+    olx_feed.poll_url(db, None, "t", url, cfg, {OWNER})
+    assert sum("нет ни одного объявления" in t for t in texts(calls)) == 1

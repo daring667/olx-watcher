@@ -124,10 +124,29 @@ def card_title(card, link) -> str:
     return link.get("title") or link.get("aria-label") or text(link)
 
 
+def found_total(soup) -> int | None:
+    """Число из «Мы нашли N объявлений»; None — если OLX его не показал."""
+    node = soup.select_one('[data-testid="total-count"], [data-testid="listing-count-msg"]')
+    match = re.search(r"(\d[\d\s\u00a0]*)", text(node)) if node else None
+    return int(re.sub(r"\D", "", match.group(1))) if match else None
+
+
 def extract_listings(search_url: str, page: str, limit: int) -> list[Listing]:
     soup = BeautifulSoup(page, "html.parser")
     found: dict[str, Listing] = {}
-    for card in soup.select('[data-cy="l-card"], [data-testid="l-card"], article, li'):
+    # На странице два блока listing-grid: первый — результаты поиска, второй —
+    # «рекомендации» OLX, случайные свежие объявления со всего сайта. Когда
+    # поиск ничего не нашёл (опечатка «1070 it»), первый пуст, и в Telegram
+    # летели котята, шины и квартиры. Читаем только первый блок и не больше
+    # объявлений, чем OLX написал в «Мы нашли N».
+    grids = soup.select('[data-testid="listing-grid"]')
+    total = found_total(soup)
+    if total == 0:
+        return []
+    if total is not None:
+        limit = min(limit, total)
+    scope = grids[0] if grids else soup
+    for card in scope.select('[data-cy="l-card"], [data-testid="l-card"], article, li'):
         link = next((a for a in card.select("a[href]") if "/d/obyavlenie/" in a.get("href", "")), None)
         if not link:
             continue
@@ -147,7 +166,7 @@ def extract_listings(search_url: str, page: str, limit: int) -> list[Listing]:
         ))
         if len(found) >= limit:
             break
-    if not found:  # запасной вариант для изменившейся вёрстки OLX
+    if not found and not grids:  # запасной вариант для изменившейся вёрстки OLX
         for link in soup.select('a[href*="/d/obyavlenie/"]'):
             url = urljoin(search_url, link["href"]).split("?")[0]
             ad_id = ad_id_from_url(url)
